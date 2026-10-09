@@ -50,7 +50,9 @@ Three forms of one function
   moves in the steps that touch it), the touched rows' ternary codes recomputed; sequences across threads. Its
   gradients are autograd's (float64, ``selftest --c``); it trains the model's own tensors in place. On AVX-512 in
   float the rows also live as 2-bit planes (the inference step's representation, refreshed for the touched rows), so
-  dot products and row updates are masked adds and subtracts, and a node state's row is one register.
+  dot products and row updates are masked adds and subtracts, and a node state's row is one register. The tape of
+  previous states (the largest thing the forward writes) is kept in bfloat16 there (``tape_bf16``; gradients within
+  ~1e-3 of the float tape's, 10% faster on one thread, 6% on four).
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
@@ -2006,6 +2008,8 @@ typedef struct {
     real *ds, *dR, *dp, *dx, *du, *gUr, *on, *Racc, *mx, *y;
     int *itapes;
     int8_t *xq8;
+    uint16_t *hp16;  // the fast path's tape of previous states in bfloat16 (n_layer, Lmax, T, D + 1, n * p)
+    int tape_bf16;   // use it (tss_work_bf16): half the tape's bytes, the states' gradients from rounded values
     Tape *tp;
     const Codes *k;  // the row codes (the fast path), or NULL
 } Work;
@@ -2020,6 +2024,8 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
     const int AL = D * (D + 1) / 2;
 #if FAST
     const int vec = k && k->ok && pv == 16;  // a node state's row is one register
+    uint16_t *hp16 = w->hp16 + (size_t)l * w->Lmax * T * (D + 1) * n * pv;
+    const int bf = vec && w->tape_bf16;
 #endif
     real *mx = w->mx, *y = w->y, *Racc = w->Racc;
     for (int t = 0; t < L; t++) {
@@ -2045,13 +2051,24 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
                 const size_t row = (size_t)tr * N + a, v = vb + kk;
                 real *ha = h + row * n * pv, *R = tp->R + v * pv;
                 const real dec = exp(-exp(A_log[row]) * dtt[tr]), wdt = dtt[tr];
-                memcpy(tp->hprev + v * n * pv, ha, sizeof(real) * n * pv);
+#if FAST
+                if (!bf)
+#endif
+                    memcpy(tp->hprev + v * n * pv, ha, sizeof(real) * n * pv);
 #if FAST
                 if (vec) {
                     const __m512 vd = _mm512_set1_ps(dec), vV = _mm512_loadu_ps(V);
                     __m512 vR = _mm512_setzero_ps();
+                    uint16_t *hb = hp16 + v * n * pv;
                     for (int j = 0; j < n; j++) {
-                        const __m512 hv = _mm512_mul_ps(_mm512_loadu_ps(ha + j * 16), vd);
+                        const __m512 h0 = _mm512_loadu_ps(ha + j * 16);
+                        if (bf) {  // the previous state, rounded to bfloat16 (nearest, ties to even)
+                            const __m512i u = _mm512_castps_si512(h0);
+                            const __m512i r = _mm512_add_epi32(u, _mm512_add_epi32(_mm512_set1_epi32(0x7fff),
+                                                               _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1))));
+                            _mm256_storeu_si256((__m256i *)(hb + j * 16), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r, 16)));
+                        }
+                        const __m512 hv = _mm512_mul_ps(h0, vd);
                         vR = _mm512_fmadd_ps(_mm512_set1_ps(C[j]), hv, vR);
                         _mm512_storeu_ps(ha + j * 16, _mm512_fmadd_ps(_mm512_set1_ps(wdt * B[j]), vV, hv));
                     }
@@ -2125,6 +2142,8 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
     const Plane *pin = k ? &k->w_in : NULL, *pout = k ? &k->w_out : NULL, *pproj = k ? &k->proj : NULL, *pU = k ? &k->U : NULL;
 #if FAST
     const int vec = k && k->ok && pv == 16;
+    const uint16_t *hp16 = w->hp16 + (size_t)l * w->Lmax * T * (D + 1) * n * pv;
+    const int bf = vec && w->tape_bf16;
 #endif
     const size_t V = (size_t)L * T * (D + 1);
     real *ds = w->ds, *dR = w->dR, *dp = w->dp, *dx = w->dx, *gUr = w->gUr, *on = w->on, *Racc = w->Racc;
@@ -2192,8 +2211,12 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
                 if (vec) {
                     const __m512 vV = _mm512_loadu_ps(Vv), vdR = _mm512_loadu_ps(dRv), vd = _mm512_set1_ps(dec);
                     __m512 vBl = _mm512_setzero_ps(), vdec = _mm512_setzero_ps();
+                    const uint16_t *hb = hp16 + v * n * pv;
                     for (int j = 0; j < n; j++) {
-                        const __m512 lv = _mm512_loadu_ps(la + j * 16), hv = _mm512_loadu_ps(hp + j * 16);
+                        const __m512 lv = _mm512_loadu_ps(la + j * 16);
+                        const __m512 hv = bf ? _mm512_castsi512_ps(_mm512_slli_epi32(
+                                                   _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(hb + j * 16))), 16))
+                                             : _mm512_loadu_ps(hp + j * 16);
                         dB[j] += dtv * _mm512_reduce_add_ps(_mm512_mul_ps(lv, vV));
                         vBl = _mm512_fmadd_ps(_mm512_set1_ps(B[j]), lv, vBl);
                         dC[j] += dec * _mm512_reduce_add_ps(_mm512_mul_ps(hv, vdR));
@@ -2269,6 +2292,7 @@ Work *tss_work_new(const Cfg *c, int Lmax) {
     w->gUr = calloc(c->p, sizeof(real)), w->on = calloc(c->D + 1, sizeof(real)), w->Racc = calloc(c->p, sizeof(real));
     w->mx = calloc(d, sizeof(real)), w->y = calloc(d, sizeof(real));
     w->xq8 = calloc((size_t)nl * Lmax * d, 1);
+    w->hp16 = calloc((size_t)nl * Lmax * T * (c->D + 1) * c->n * c->p, sizeof(uint16_t));
     for (int l = 0; l < nl; l++) {
         tape_carve(c, Lmax, w->tapes + tr * l, w->itapes + ti * l, w->tp + l);
         w->tp[l].xq = w->xq8 + (size_t)l * Lmax * d;
@@ -2279,8 +2303,10 @@ Work *tss_work_new(const Cfg *c, int Lmax) {
 void tss_work_free(Work *w) {
     free(w->tapes), free(w->itapes), free(w->tp), free(w->x), free(w->g), free(w->h), free(w->lam), free(w->xn);
     free(w->dxn), free(w->lg), free(w->ds), free(w->dR), free(w->dp), free(w->dx), free(w->du), free(w->gUr);
-    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w->xq8), free(w);
+    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w->xq8), free(w->hp16), free(w);
 }
+
+void tss_work_bf16(Work *w, int on) { w->tape_bf16 = on; }
 
 // One sequence: tokens (L), labels (L, -100 = unscored). Adds the sequence's summed cross-entropy gradients into G
 // (Params-shaped, zeroed by the caller) and its node-row hits into hit (n_layer * T * N bytes). Returns the summed loss;
@@ -2489,7 +2515,8 @@ class CTrainer:
 
     NAMES = ["embed", "norm_f", "norm", "conv", "w_in", "bias", "w_out", "A_log", "proj", "dt_bias", "U"]
 
-    def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False, fast=True):
+    def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False, fast=True,
+                 tape_bf16=True):
         import ctypes
 
         import numpy as np
@@ -2544,6 +2571,9 @@ class CTrainer:
         self.Gt = (Params * threads)(*[mk(g) for g in self.gt])
         self.hits = np.zeros(threads * rows, dtype=np.uint8)
         self.ws = (ctypes.c_void_p * threads)(*[lib.tss_work_new(ctypes.byref(self.cfg), Lmax) for _ in range(threads)])
+        lib.tss_work_bf16.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        for w in self.ws:  # the fast path's tape of previous states in bfloat16 (no effect elsewhere)
+            lib.tss_work_bf16(w, int(tape_bf16))
         self.hp = Hyper(lr, 0.9, 0.98, 1e-8, weight_decay, clip, 0)
         for k, ts in tensors.items():  # the model's parameters become views of the C arrays
             off = 0
