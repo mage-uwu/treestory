@@ -56,7 +56,11 @@ Three forms of one function
   The branch gradient follows the other subtree all the way down. Capping it (comparing only the next r levels of
   both subtrees) was tried and removed: on Tiny Shakespeare (5,000 steps, one seed, 4 threads) held-out 1.594
   nats/byte full in 12.3 min, 1.633 at r = 2 in 10.0 min, 1.653 at r = 1 in 9.1 min; the full gradient is ahead at
-  equal wall time too.
+  equal wall time too. What does pay: sampling the walks, unbiased (``walks`` m: a branch is walked with probability
+  q = min(1, m sigma' / sum sigma') over its tree's branches and its term reweighted by 1 / q; the mean converges to
+  the exact gradient, selftest --c). Tiny Shakespeare, 5,000 steps, one seed: exact 1.594 in 12.3 min (27.8K
+  tokens/s), 2 walks of 7 1.602 in 9.7 min (35.3K), 1 walk 1.605 in 8.5 min (40.0K); step for step within ~0.01 of
+  exact, and ahead at equal wall time (~8.6 min: exact ~1.62, 2 walks ~1.59, 1 walk 1.61). Default: exact.
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
@@ -1734,6 +1738,8 @@ typedef REAL real;
 
 typedef struct {
     int vocab, d, n_layer, T, D, n, p, K, group;
+    int walks;  // 0: every branch's walk through the other subtree (exact); m > 0: m in expectation, sampled and
+                // reweighted (an unbiased estimate of the branch gradient)
     real temp;
 } Cfg;
 
@@ -1986,11 +1992,12 @@ typedef struct {  // one layer's tape over a sequence of L tokens
     real *s, *R, *hprev, *decay;        // (L, T, D + 1), (.., p), (.., n * p), (..)
     int *anode;                         // the other subtrees: (L, T, D (D + 1) / 2)
     real *as, *aR;                      // (.., ), (.., p)
+    real *bw;                           // (L, T, D + 1): 1 / q for a walked branch, 0 for one not walked
 } Tape;
 
 static size_t tape_reals(const Cfg *c, int L) {
     const size_t V = (size_t)L * c->T * (c->D + 1), A = (size_t)L * c->T * c->D * (c->D + 1) / 2;
-    return (size_t)L * (3 * c->d + 2 + PDIM(c) + c->T) + V * (1 + c->p + c->n * c->p + 1) + A * (1 + c->p);
+    return (size_t)L * (3 * c->d + 2 + PDIM(c) + c->T) + V * (1 + c->p + c->n * c->p + 1 + 1) + A * (1 + c->p);
 }
 
 static void tape_carve(const Cfg *c, int L, real *buf, int *ibuf, Tape *tp) {
@@ -2008,6 +2015,7 @@ static void tape_carve(const Cfg *c, int L, real *buf, int *ibuf, Tape *tp) {
     tp->decay = buf, buf += V;
     tp->as = buf, buf += A;
     tp->aR = buf, buf += A * c->p;
+    tp->bw = buf, buf += V;
     tp->node = ibuf, ibuf += V;
     tp->anode = ibuf;
 }
@@ -2025,7 +2033,15 @@ typedef struct {
     int tape_bf16;   // use it (tss_work_bf16): half the tape's bytes, the states' gradients from rounded values
     Tape *tp;
     const Codes *k;  // the row codes (the fast path), or NULL
+    uint64_t rng;    // the walks' sampler (cfg walks > 0)
 } Work;
+
+static inline real urand(uint64_t *s) {  // xorshift64*, uniform in [0, 1)
+    *s ^= *s >> 12, *s ^= *s << 25, *s ^= *s >> 27;
+    return (real)((*s * 2685821657736338717ULL) >> 11) * (real)(1.0 / 9007199254740992.0);
+}
+
+void tss_work_seed(Work *w, uint64_t seed) { w->rng = seed * 0x9E3779B97F4A7C15ULL + 1; }
 
 static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int L, real *xres, real *h, Tape *tp, Work *w) {
     const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c), g = c->group;
@@ -2119,15 +2135,31 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
         // trees' are independent, so they advance level by level together and their fetches overlap. Each chain's
         // nodes are stored at base(kk) + (level - kk - 1), base(kk) = sum over m < kk of (D - m).
         int *cn = w->walk;
-        for (int tr = 0; tr < T; tr++)
+        for (int tr = 0; tr < T; tr++) {
+            const size_t vb = ((size_t)t * T + tr) * (D + 1);
+            real tot = 0;
             for (int kk = 0; kk < D; kk++) {
-                const size_t v = ((size_t)t * T + tr) * (D + 1) + kk;
+                const size_t v = vb + kk;
                 cn[tr * (D + 1) + kk] = 2 * (tp->node[v] - tr * N) + 2 - (tp->s[v] > 0);
+                const real sg = sigm(fabs(tp->s[v]) / c->temp);
+                tp->bw[v] = sg * (1 - sg);  // sigma': the branch term's weight
+                tot += tp->bw[v];
             }
+            for (int kk = 0; kk < D; kk++) {  // walk branch kk with probability q = min(1, m sigma' / sum sigma')
+                const size_t v = vb + kk;
+                if (c->walks <= 0) {
+                    tp->bw[v] = 1;
+                    continue;
+                }
+                const real q = tot > 0 ? fmin(1, c->walks * tp->bw[v] / tot) : 1;
+                tp->bw[v] = urand(&w->rng) < q ? 1 / q : 0;
+            }
+        }
         for (int j = 1; j <= D; j++)
             for (int tr = 0; tr < T; tr++) {
                 const size_t ab = ((size_t)t * T + tr) * AL;
                 for (int kk = 0, base = 0; kk < j; base += D - kk, kk++) {
+                    if (tp->bw[((size_t)t * T + tr) * (D + 1) + kk] == 0) continue;  // a branch not walked this time
                     const size_t ai = ab + base + (j - kk - 1), row = (size_t)tr * N + cn[tr * (D + 1) + kk];
                     const real dec = exp(-exp(A_log[row]) * dtt[tr]), *hr = h + row * n * pv;
                     real *R = tp->aR + ai * pv;
@@ -2208,6 +2240,11 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
             }
             int ai = 0;
             for (int kk = 0; kk < D; kk++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp
+                const real bwk = tp->bw[vb + kk];
+                if (bwk == 0) {  // not walked: no term (its expectation is carried by the walked ones' weights)
+                    ai += D - kk;
+                    continue;
+                }
                 real onk = 0, alt = 0;
                 for (int j = kk + 1; j <= D; j++) onk += on[j];
                 for (int j = kk + 1; j <= D; j++, ai++) {
@@ -2215,7 +2252,7 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
                     alt += gelu(tp->as[a]) * qdotf(k, pout, Q->w_out, r_node + row, gy, d, gs) + dotr(gUr, tp->aR + a * pv, pv);
                 }
                 const real s = tp->s[vb + kk], sg = sigm(fabs(s) / c->temp);
-                ds[vb + kk] += (s > 0 ? 1 : -1) * (onk - alt) * sg * (1 - sg) / c->temp;
+                ds[vb + kk] += bwk * (s > 0 ? 1 : -1) * (onk - alt) * sg * (1 - sg) / c->temp;
             }
             for (int kk = 0; kk <= D; kk++) {  // s = <x, w_in> + bias + <Z, R>
                 const size_t v = vb + kk, row = tp->node[v];
@@ -2466,6 +2503,7 @@ real tss_train_step(const Cfg *c, Params *P, Params *Q, Params *G, unsigned char
         const int th = 0;
 #endif
         int ns = 0;
+        tss_work_seed(ws[th], (uint64_t)h->step * 1000003ULL + (uint64_t)b);
         loss += tss_train_seq(c, P, Q, Gt + th, tokens + (size_t)b * L, labels + (size_t)b * L, L, hits + rows * th, &ns, ws[th], k);
         scored += ns;
     }
@@ -2572,7 +2610,7 @@ class CTrainer:
     NAMES = ["embed", "norm_f", "norm", "conv", "w_in", "bias", "w_out", "A_log", "proj", "dt_bias", "U"]
 
     def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False, fast=True,
-                 tape_bf16=True):
+                 tape_bf16=True, walks=0):
         import ctypes
 
         import numpy as np
@@ -2587,7 +2625,8 @@ class CTrainer:
         PR = self.PR = ctypes.POINTER(R)
 
         class Cfg(ctypes.Structure):
-            _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "T", "D", "n", "p", "K", "group")] + [("temp", R)]
+            _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "T", "D", "n", "p", "K", "group", "walks")] + [
+                ("temp", R)]
 
         class Params(ctypes.Structure):
             _fields_ = [(k, PR) for k in self.NAMES]
@@ -2609,7 +2648,7 @@ class CTrainer:
         lib.tss_train_step.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, P8, PP, PP, PP, P8, ctypes.POINTER(ctypes.c_void_p),
                                        ctypes.c_int, PI, PI, ctypes.c_int, ctypes.c_int, ctypes.POINTER(Hyper), ctypes.c_void_p]
         self.cfg = Cfg(c.vocab_size, c.d_model, c.n_layer, c.trees, c.depth, c.state, c.value, c.d_conv,
-                       group_size(c.d_model, c.ternary_group), c.temp)
+                       group_size(c.d_model, c.ternary_group), walks, c.temp)
         tensors = _c_tensors(model)
         self.arrays = {k: np.ascontiguousarray(torch.cat([t.detach().flatten() for t in v]).numpy().astype(self.dtype))
                        for k, v in tensors.items()}
@@ -2628,6 +2667,7 @@ class CTrainer:
         self.hits = np.zeros(threads * rows, dtype=np.uint8)
         self.ws = (ctypes.c_void_p * threads)(*[lib.tss_work_new(ctypes.byref(self.cfg), Lmax) for _ in range(threads)])
         lib.tss_work_bf16.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.tss_work_seed.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         for w in self.ws:  # the fast path's tape of previous states in bfloat16 (no effect elsewhere)
             lib.tss_work_bf16(w, int(tape_bf16))
         self.hp = Hyper(lr, 0.9, 0.98, 1e-8, weight_decay, clip, 0)
@@ -2640,8 +2680,11 @@ class CTrainer:
     def _ptr(self, a, kind):
         return a.ctypes.data_as(self.ct.POINTER(kind))
 
-    def grad(self, tokens, labels):
-        """One sequence's summed loss; its gradients added into self.grads (the C layout, not the model's .grad)."""
+    def grad(self, tokens, labels, seed=None):
+        """One sequence's summed loss; its gradients added into self.grads (the C layout, not the model's .grad).
+        seed: the walks' sampler (walks > 0)."""
+        if seed is not None:
+            self.lib.tss_work_seed(self.ws[0], seed)
         tok = self.np.ascontiguousarray(tokens, dtype=self.np.int32)
         lab = self.np.ascontiguousarray(labels, dtype=self.np.int32)
         ns = self.ct.c_int()
@@ -2682,6 +2725,23 @@ def selftest_c():
     worst = max((np.abs(want[k] - tr.grads[k]).max() / (np.abs(want[k]).max() + 1e-30), k) for k in want)
     print(f"C training step vs autograd, float64: loss equal, worst gradient {worst[0]:.1e} ({worst[1]})")
     assert worst[0] < 1e-12, "the C training step's gradients disagree with autograd"
+    # sampled walks: the mean of the estimates converges to the exact gradient as 1 / sqrt(N) (unbiased)
+    exact = np.concatenate([tr.grads[k].ravel() for k in tr.NAMES])
+    sampled = CTrainer(model, Lmax=64, double=True, walks=1)
+
+    def mean_error(seeds):
+        acc = 0
+        for sd in seeds:
+            for v in sampled.grads.values():
+                v[:] = 0
+            for b in range(2):
+                sampled.grad(ids[b].numpy(), labels[b].numpy(), seed=sd * 2 + b)
+            acc = acc + np.concatenate([sampled.grads[k].ravel() for k in sampled.NAMES])
+        return np.linalg.norm(acc / len(seeds) - exact) / np.linalg.norm(exact)
+
+    e25, e400 = mean_error(range(25)), mean_error(range(25, 425))
+    print(f"sampled walks (1 of 3): the mean's error {e25:.3f} over 25 samples, {e400:.3f} over 400 (unbiased: ~4x less)")
+    assert e400 < 0.4 * e25, "the sampled branch gradient looks biased"
     print("selftest --c passed")
 
 
@@ -2702,11 +2762,11 @@ def lm(a):
     cfg = Config(vocab_size=256, d_model=a.d_model, n_layer=a.layers, trees=a.trees, depth=a.depth, state=a.state,
                  value=a.value)
     model = TSS(cfg)
-    trainer = CTrainer(model, threads=a.threads, lr=a.lr, Lmax=a.seq_len) if a.engine == "c" else None
+    trainer = CTrainer(model, threads=a.threads, lr=a.lr, Lmax=a.seq_len, walks=a.walks) if a.engine == "c" else None
     opt = None if trainer else torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.98), weight_decay=0.01)
     print(f"tss lm ({a.engine}): {a.data} ({len(train):,} bytes to train on, {len(held):,} held out), "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters, d {a.d_model}, {a.layers} layers x "
-          f"{a.trees} trees of depth {a.depth}, batch {a.batch} x {a.seq_len}", flush=True)
+          f"{a.trees} trees of depth {a.depth}, batch {a.batch} x {a.seq_len}, branch walks {a.walks or 'all'}", flush=True)
 
     def windows(data, n, gen):
         starts = torch.randint(0, len(data) - a.seq_len - 1, (n,), generator=gen)
@@ -2789,6 +2849,8 @@ def main():
     lmp.add_argument("--layers", type=int, default=4)
     lmp.add_argument("--trees", type=int, default=4)
     lmp.add_argument("--depth", type=int, default=7)
+    lmp.add_argument("--walks", type=int, default=0,
+                     help="the branch gradient's walks per tree and token, sampled and reweighted (0: all, exact)")
     lmp.add_argument("--state", type=int, default=16)
     lmp.add_argument("--value", type=int, default=16)
     lmp.add_argument("--steps", type=int, default=3000)
