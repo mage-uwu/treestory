@@ -21,6 +21,21 @@ rarely gets a full step, where SGD would scale it down by its traffic.
     python deepboost.py mqar --opt adam      --lr 3e-3
     python deepboost.py mqar --opt deepboost --lr 3e-3 --eta 0.1
     python deepboost.py lm   --opt deepboost ...       # bytes of the Python standard library's source
+
+Shoot-out (one seed each; 2 layers, d 64, 4 trees of depth 5, ternary; 1,000 steps, warmup then cosine; 2 CPU threads)
+MQAR, recall at steps 400 / 600 / 1,000 (batch 64; 8 pairs of 32 keys):
+    Adam 1e-3 / 3e-3 / 1e-2                          0.17 / 0.18 / 0.19,  0.20 / 0.20 / 0.21,  0.91 / 0.97 / 0.986
+    DeepBoost, eta 0.1, eta_split 0.3, Adam 1e-2     0.87 / 0.96 / 0.983  (the best of 7 settings at Adam 1e-2)
+    DeepBoost, any setting, Adam 3e-3                0.19 - 0.20 at 1,000 (5 settings)
+    DeepBoost --fisher (4 settings of eta, lambda)   0.03 - 0.33 at 1,000
+LM, held-out bits per byte at steps 200 / 600 / 1,000 (batch 32 x 64 bytes):
+    Adam 1e-2                                        3.27 / 2.90 / 2.826     (Adam 3e-3: 2.988)
+    DeepBoost, eta 0.1, eta_split 0.3, Adam 1e-2     3.20 / 2.92 / 2.854     (Adam 3e-3: 2.970)
+Seconds per step: MQAR Adam 0.33, DeepBoost 0.40; LM Adam 0.55, DeepBoost 0.64 (--fisher about twice that).
+So far it is a tie at best: at Adam's best rate Adam ends slightly ahead on both tasks; DeepBoost leads early on the
+LM and ends ahead at the lower rate. Whether recall takes off is set by the rate of the dense parameters, not by the
+node updates. The Fisher curvature (XGBoost's h) makes it worse: early in training it is tiny and the Newton steps
+too large, and damping enough to stop that leaves too little step.
 """
 
 import argparse
