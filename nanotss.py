@@ -53,6 +53,11 @@ Three forms of one function
   dot products and row updates are masked adds and subtracts, and a node state's row is one register. The tape of
   previous states (the largest thing the forward writes) is kept in bfloat16 there (``tape_bf16``; gradients within
   ~1e-3 of the float tape's, 10% faster on one thread, 6% on four).
+* the branch gradient's depth (``branch_depth`` r, 0 = all the way): a branch at level k compares levels k + 1 .. k + r
+  of the subtree the token took and of the other one; in the definition, a node's path weight carries the gradient of
+  the branches at most r levels above it. The training form, ``reference`` and the C step agree on it (selftest,
+  selftest --c). The other subtrees' walks are most of what training costs beyond inference; capping them is the
+  largest lever left (Shakespeare model on 4 threads: 29.4K tokens/s full, 37.2K at r = 2, 40.8K at r = 1).
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
@@ -122,6 +127,7 @@ class Config:
     value: int = 16  # value size (V, Z, the readout)
     d_conv: int = 3  # causal depthwise, over the current and previous tokens
     temp: float = 1.0
+    branch_depth: int = 0  # the branch gradient compares the two subtrees this many levels down (0: all the way)
     memory: bool = True  # False: the same trees, stateless (the ablation)
     readout: str = "tree"  # the reads' readout U: per tree and level, per tree (summed over the path), or "layer"
     ternary: bool = True  # w_in, w_out, proj and U ternary (absmean per group), straight-through to latent weights
@@ -310,23 +316,27 @@ class TreeSSM(nn.Module):
             return y
         with torch.no_grad():  # the branch gradient's two sides: on (taken, below the branch) and alt (the other child down)
             on = torch.stack([out for _, _, out in path]).flip(0).cumsum(0).flip(0)  # on[k] = sum of levels >= k
+            r = cfg.branch_depth or D  # a branch at level k compares levels k + 1 .. k + r of both subtrees
             chains = []  # per branch level k: the other subtree's node on the current level, and its output so far
             for j in range(1, D + 1):
                 a, s_prev = path[j - 1][0], path[j - 1][1]
                 chains.append([2 * a + 2 - (s_prev > 0).long(), 0])  # the other child of level j - 1's branch
-                for c, (s_alt, out_alt) in zip(chains, level(j, path[j][0], [c[0] for c in chains])[1:]):
+                live = [c for k, c in enumerate(chains) if j - k <= r]
+                for c, (s_alt, out_alt) in zip(live, level(j, path[j][0], [c[0] for c in live])[1:]):
                     c[1] = c[1] + out_alt
                     c[0] = 2 * c[0] + 1 + (s_alt > 0).long()
         for k in range(D):
             s_k = path[k][1]
             g = torch.sigmoid(torch.where(s_k > 0, s_k, -s_k) / cfg.temp)
-            y = y + torch.einsum("blt,bltd->bld", g - g.detach(), on[k + 1] - chains[k][1])  # zero going forward
+            taken = on[k + 1] - (on[k + r + 1] if k + r + 1 <= D else 0)  # the taken subtree's levels k + 1 .. k + r
+            y = y + torch.einsum("blt,bltd->bld", g - g.detach(), taken - chains[k][1])  # zero going forward
         return y
 
     def reference(self, u):
         """The definition, for selftest: every node of every tree for every token, with its read (what the token would
         find there: the states its visitors wrote before it), times its path weight, the product of the branch values
-        above it (the hard step going forward, sigmoid(s / temp) going backward), as GTS's path-weight definition."""
+        above it (the hard step going forward, sigmoid(s / temp) going backward), as GTS's path-weight definition.
+        With branch_depth r, a node's path weight carries the gradient of the branches at most r levels above it only."""
         cfg = self.cfg
         b, L, _ = u.shape
         T, D = cfg.trees, cfg.depth
@@ -336,9 +346,14 @@ class TreeSSM(nn.Module):
             B, C, V, Z, dt = self.signals(x, proj)
             CB = torch.einsum("btn,bsn->bts", C, B)
         node = torch.zeros(b, L, T, dtype=torch.long)
-        pi = torch.ones(b, L, T, 1, dtype=u.dtype)
+        r = cfg.branch_depth or D
+        factors = []  # per level m: its nodes' children's branch values, (b, l, trees, 2^(m+1))
         y = torch.zeros_like(u)
         for k in range(D + 1):
+            pi = torch.ones(b, L, T, 2**k, dtype=u.dtype)
+            for m, f in enumerate(factors):  # the branches above level k, each expanded to level k's nodes
+                f = f.repeat_interleave(2 ** (k - m - 1), dim=3)
+                pi = pi * (f if k - m <= r else f.detach())
             ids = torch.arange(2**k - 1, 2 ** (k + 1) - 1)  # level k's nodes
             s = torch.einsum("bld,tnd->bltn", x, w_in[:, ids]) + self.bias[:, ids]
             out = F.gelu(s)[..., None] * w_out[:, ids]
@@ -358,7 +373,7 @@ class TreeSSM(nn.Module):
             g = (s > 0).to(u.dtype)
             p = torch.sigmoid(s / cfg.temp)
             g = g + (p - p.detach())
-            pi = torch.stack([pi * (1 - g), pi * g], -1).flatten(3)  # children 2i+1, 2i+2
+            factors.append(torch.stack([1 - g, g], -1).flatten(3))  # children 2i+1, 2i+2
             here = node - (2**k - 1)
             node = 2 * node + 1 + (s.gather(3, here[..., None]).squeeze(-1) > 0).long()
         return y
@@ -764,9 +779,10 @@ def selftest():
     """In float64: the training form against the token-at-a-time recurrence (logits, routes included), and its
     gradients, the branch gradient's counterfactual side included, against the path-weight definition."""
     torch.manual_seed(0)
-    for memory, readout, quant in ((True, "level", True), (True, "tree", True), (True, "layer", False), (False, "tree", True)):
+    for memory, readout, quant, bd in ((True, "level", True, 0), (True, "tree", True, 0), (True, "layer", False, 0),
+                                       (False, "tree", True, 0), (True, "tree", True, 1), (True, "tree", True, 2)):
         cfg = Config(vocab_size=50, d_model=32, n_layer=2, trees=3, depth=3, state=4, value=6, memory=memory,
-                     readout=readout, ternary=quant, act_bits=8 if quant else 0, ternary_group=16)
+                     readout=readout, ternary=quant, act_bits=8 if quant else 0, ternary_group=16, branch_depth=bd)
         model = TSS(cfg).double()
         for layer in model.layers:  # spread the logits so both branches get traffic
             layer.w_in.data *= 4
@@ -1730,6 +1746,7 @@ typedef REAL real;
 
 typedef struct {
     int vocab, d, n_layer, T, D, n, p, K, group;
+    int bdepth;  // the branch gradient compares the two subtrees this many levels down (0: all the way)
     real temp;
 } Cfg;
 
@@ -1742,6 +1759,7 @@ typedef struct {  // every tensor's layers one after another, in the layer's own
 
 #define NODES(c) ((1 << ((c)->D + 1)) - 1)
 #define PDIM(c) (2 * (c)->n + 2 * (c)->p + (c)->T)
+#define BDEPTH(c) ((c)->bdepth > 0 && (c)->bdepth < (c)->D ? (c)->bdepth : (c)->D)
 
 static real gelu(real x) { return (real)0.5 * x * (1 + erf(x * (real)0.70710678118654752440)); }
 static real dgelu(real x) {
@@ -2113,17 +2131,20 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
         // the other subtrees (read-only: their states as they stand at t, the token's own arrival decay): the chain from
         // branch kk enters the other child at level kk + 1 and follows its own decisions down; a tree's D chains and the
         // trees' are independent, so they advance level by level together and their fetches overlap. Each chain's
-        // nodes are stored at base(kk) + (level - kk - 1), base(kk) = sum over m < kk of (D - m).
+        // nodes are stored at base(kk) + (level - kk - 1), base(kk) = sum over m < kk of min(D - m, r): a chain runs r
+        // levels (the branch gradient's depth).
         int *cn = w->walk;
         for (int tr = 0; tr < T; tr++)
             for (int kk = 0; kk < D; kk++) {
                 const size_t v = ((size_t)t * T + tr) * (D + 1) + kk;
                 cn[tr * (D + 1) + kk] = 2 * (tp->node[v] - tr * N) + 2 - (tp->s[v] > 0);
             }
+        const int rb = BDEPTH(c);
         for (int j = 1; j <= D; j++)
             for (int tr = 0; tr < T; tr++) {
                 const size_t ab = ((size_t)t * T + tr) * AL;
-                for (int kk = 0, base = 0; kk < j; base += D - kk, kk++) {
+                for (int kk = 0, base = 0; kk < j; base += (D - kk < rb ? D - kk : rb), kk++) {
+                    if (j - kk > rb) continue;  // this chain has run its r levels
                     const size_t ai = ab + base + (j - kk - 1), row = (size_t)tr * N + cn[tr * (D + 1) + kk];
                     const real dec = exp(-exp(A_log[row]) * dtt[tr]), *hr = h + row * n * pv;
                     real *R = tp->aR + ai * pv;
@@ -2143,7 +2164,7 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
                     tp->anode[ai] = (int)row, tp->as[ai] = s;
                     const int nx = 2 * cn[tr * (D + 1) + kk] + 1 + (s > 0);
                     cn[tr * (D + 1) + kk] = nx;
-                    if (j < D) {  // the next node's state and row, while the other chains run
+                    if (j < D && j - kk < rb) {  // the next node's state and row, while the other chains run
                         const size_t nr = (size_t)tr * N + nx;
                         const char *hs = (const char *)(h + nr * n * pv);
                         for (int o = 0; o < n * pv * (int)sizeof(real); o += 64) __builtin_prefetch(hs + o);
@@ -2203,10 +2224,12 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
                 hit[row] = 1;
             }
             int ai = 0;
-            for (int kk = 0; kk < D; kk++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp
+            const int rb = BDEPTH(c);
+            for (int kk = 0; kk < D; kk++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp, r levels each
+                const int jend = kk + rb < D ? kk + rb : D;
                 real onk = 0, alt = 0;
-                for (int j = kk + 1; j <= D; j++) onk += on[j];
-                for (int j = kk + 1; j <= D; j++, ai++) {
+                for (int j = kk + 1; j <= jend; j++) onk += on[j];
+                for (int j = kk + 1; j <= jend; j++, ai++) {
                     const size_t a = ab + ai, row = tp->anode[a];
                     alt += gelu(tp->as[a]) * qdotf(k, pout, Q->w_out, r_node + row, gy, d, gs) + dotr(gUr, tp->aR + a * pv, pv);
                 }
@@ -2583,7 +2606,8 @@ class CTrainer:
         PR = self.PR = ctypes.POINTER(R)
 
         class Cfg(ctypes.Structure):
-            _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "T", "D", "n", "p", "K", "group")] + [("temp", R)]
+            _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "T", "D", "n", "p", "K", "group", "bdepth")] + [
+                ("temp", R)]
 
         class Params(ctypes.Structure):
             _fields_ = [(k, PR) for k in self.NAMES]
@@ -2605,7 +2629,7 @@ class CTrainer:
         lib.tss_train_step.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, P8, PP, PP, PP, P8, ctypes.POINTER(ctypes.c_void_p),
                                        ctypes.c_int, PI, PI, ctypes.c_int, ctypes.c_int, ctypes.POINTER(Hyper), ctypes.c_void_p]
         self.cfg = Cfg(c.vocab_size, c.d_model, c.n_layer, c.trees, c.depth, c.state, c.value, c.d_conv,
-                       group_size(c.d_model, c.ternary_group), c.temp)
+                       group_size(c.d_model, c.ternary_group), c.branch_depth, c.temp)
         tensors = _c_tensors(model)
         self.arrays = {k: np.ascontiguousarray(torch.cat([t.detach().flatten() for t in v]).numpy().astype(self.dtype))
                        for k, v in tensors.items()}
@@ -2661,23 +2685,24 @@ def selftest_c():
     """The C training step against autograd, in float64: the loss and every parameter's gradient."""
     import numpy as np
 
-    torch.manual_seed(0)
-    cfg = Config(vocab_size=50, d_model=32, n_layer=2, trees=3, depth=3, state=4, value=6, ternary_group=16)
-    model = TSS(cfg).double()
-    for layer in model.layers:
-        layer.w_in.data *= 4
-    ids = torch.randint(0, 50, (2, 20))
-    labels = ids.clone()
-    labels[:, :5] = -100
-    loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten(), reduction="sum")
-    loss.backward()
-    want = {k: torch.cat([t.grad.flatten() for t in ts]).numpy() for k, ts in _c_tensors(model).items()}
-    tr = CTrainer(model, Lmax=64, double=True)
-    closs = sum(tr.grad(ids[b].numpy(), labels[b].numpy()) for b in range(2))
-    assert abs(closs - loss.item()) < 1e-9 * abs(loss.item()), f"C loss {closs} != {loss.item()}"
-    worst = max((np.abs(want[k] - tr.grads[k]).max() / (np.abs(want[k]).max() + 1e-30), k) for k in want)
-    print(f"C training step vs autograd, float64: loss equal, worst gradient {worst[0]:.1e} ({worst[1]})")
-    assert worst[0] < 1e-12, "the C training step's gradients disagree with autograd"
+    for bd in (0, 1, 2):  # the branch gradient all the way down, and capped
+        torch.manual_seed(0)
+        cfg = Config(vocab_size=50, d_model=32, n_layer=2, trees=3, depth=3, state=4, value=6, ternary_group=16, branch_depth=bd)
+        model = TSS(cfg).double()
+        for layer in model.layers:
+            layer.w_in.data *= 4
+        ids = torch.randint(0, 50, (2, 20))
+        labels = ids.clone()
+        labels[:, :5] = -100
+        loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten(), reduction="sum")
+        loss.backward()
+        want = {k: torch.cat([t.grad.flatten() for t in ts]).numpy() for k, ts in _c_tensors(model).items()}
+        tr = CTrainer(model, Lmax=64, double=True)
+        closs = sum(tr.grad(ids[b].numpy(), labels[b].numpy()) for b in range(2))
+        assert abs(closs - loss.item()) < 1e-9 * abs(loss.item()), f"C loss {closs} != {loss.item()}"
+        worst = max((np.abs(want[k] - tr.grads[k]).max() / (np.abs(want[k]).max() + 1e-30), k) for k in want)
+        print(f"branch_depth {bd}: C training step vs autograd, float64: loss equal, worst gradient {worst[0]:.1e} ({worst[1]})")
+        assert worst[0] < 1e-12, "the C training step's gradients disagree with autograd"
     print("selftest --c passed")
 
 
@@ -2696,13 +2721,14 @@ def lm(a):
     split = int(len(raw) * 0.9)
     train, held = torch.from_numpy(raw[:split].astype(np.int64)), torch.from_numpy(raw[split:].astype(np.int64))
     cfg = Config(vocab_size=256, d_model=a.d_model, n_layer=a.layers, trees=a.trees, depth=a.depth, state=a.state,
-                 value=a.value)
+                 value=a.value, branch_depth=a.branch_depth)
     model = TSS(cfg)
     trainer = CTrainer(model, threads=a.threads, lr=a.lr, Lmax=a.seq_len) if a.engine == "c" else None
     opt = None if trainer else torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.98), weight_decay=0.01)
     print(f"tss lm ({a.engine}): {a.data} ({len(train):,} bytes to train on, {len(held):,} held out), "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters, d {a.d_model}, {a.layers} layers x "
-          f"{a.trees} trees of depth {a.depth}, batch {a.batch} x {a.seq_len}", flush=True)
+          f"{a.trees} trees of depth {a.depth}, branch gradient depth {a.branch_depth or 'full'}, batch {a.batch} x {a.seq_len}",
+          flush=True)
 
     def windows(data, n, gen):
         starts = torch.randint(0, len(data) - a.seq_len - 1, (n,), generator=gen)
@@ -2785,6 +2811,7 @@ def main():
     lmp.add_argument("--layers", type=int, default=4)
     lmp.add_argument("--trees", type=int, default=4)
     lmp.add_argument("--depth", type=int, default=7)
+    lmp.add_argument("--branch-depth", type=int, default=0, help="cap the branch gradient's depth (0: full)")
     lmp.add_argument("--state", type=int, default=16)
     lmp.add_argument("--value", type=int, default=16)
     lmp.add_argument("--steps", type=int, default=3000)
