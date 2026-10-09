@@ -48,7 +48,9 @@ Three forms of one function
   adjoint state per node, run backward in time), and for the branch gradient the other subtree's nodes as scalars
   <g, out> only; dense backprop for the rest (proj, U, conv, norms, the output layer). AdamW, lazy on node rows (a row
   moves in the steps that touch it), the touched rows' ternary codes recomputed; sequences across threads. Its
-  gradients are autograd's (float64, ``selftest --c``); it trains the model's own tensors in place.
+  gradients are autograd's (float64, ``selftest --c``); it trains the model's own tensors in place. On AVX-512 in
+  float the rows also live as 2-bit planes (the inference step's representation, refreshed for the touched rows), so
+  dot products and row updates are masked adds and subtracts, and a node state's row is one register.
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
@@ -76,9 +78,12 @@ weights, is what a stateful tree moves: 1 KB a visit in float32 against 128 byte
 Training cost per token is flat in length (PyTorch on 4 CPU threads, 2 layers, d 64: 240 - 300 us/token from 64 to
 4,096 tokens). The Triton kernels match PyTorch in the interpreter (logits 2e-7, gradients <= 1.5e-4); their speed on a
 GPU is unmeasured. Not yet trained on language.
-Training on a CPU, the sparse C step against PyTorch (forward, backward, AdamW; same model, same CPU, first version
-without SIMD): 6 - 7x on one thread, 9 - 11x on four (recall-size model: 49K tokens/s on 4 threads; 12.9M parameters:
-3.9K tokens/s). MQAR with --engine c, 4 threads: recall 0.973 at 2,000 steps in 68 s (PyTorch: 0.983, 645 s on 2).
+Training on a CPU, the sparse C step against PyTorch (forward, backward, AdamW; same model, same CPU): 14 - 16x on one
+thread, 19 - 22x on four (recall-size model: 97K tokens/s on 4 threads; 12.9M parameters: 427 us/token on one thread,
+8.3K tokens/s on four). The rows as 2-bit planes (masked integer and float add/subtract), the node states' rows as
+AVX-512 registers forward and backward, the optimizer parallel over rows (at a batch of 2,048 tokens 89% of the node
+rows are touched: per token the update is sparse, per batch it is not). MQAR with --engine c on 4 threads: recall
+0.968 at 2,000 steps in 30 s (PyTorch: 0.983 in 645 s on 2).
 Hard routing turns float32 rounding into an occasional different branch (an activation within rounding of zero), as in
 GTS: the C kernels agree with each other to rounding, and with PyTorch but for such tokens.
 """
@@ -1769,8 +1774,8 @@ void tss_quantize(const Cfg *c, const Params *P, Params *Q) {
     tss_ternary(P->U, Q->U, L * c->T * c->p, c->d, c->group);
 }
 
-// per-token 8-bit activations (nanotss.quantize_activations)
-static void quant8(const real *x, real *xq, int d) {
+// per-token 8-bit activations (nanotss.quantize_activations): the values, their codes, and the codes' scale
+static void quant8(const real *x, real *xq, int8_t *code, real *xs, int d) {
     real m = 0;
     for (int i = 0; i < d; i++) m = fabs(x[i]) > m ? fabs(x[i]) : m;
     if (m < (real)1e-5) m = (real)1e-5;
@@ -1779,7 +1784,9 @@ static void quant8(const real *x, real *xq, int d) {
         real v = nearbyint(x[i] * scale);
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
         xq[i] = v / scale;
+        code[i] = (int8_t)v;
     }
+    *xs = 1 / scale;
 }
 
 static void rmsnorm_fwd(const real *x, const real *w, real *out, int d, real *r_out) {
@@ -1799,8 +1806,169 @@ static void rmsnorm_bwd(const real *x, const real *w, real r, const real *du, re
     }
 }
 
+// ----------------------------------------------------------------------------- the rows: 2-bit codes, fast paths
+// A ternary row as two bitmasks per 64 weights (plus, minus) and one scale per group, beside the quantized values.
+// With AVX-512BW in float: a row's dot product with int8 x is masked byte add/subtract, with a float vector masked float
+// add/subtract, and y += a row is a masked add and a masked subtract per 16 floats. Without them (or in the double build
+// that checks against autograd) the same helpers run the plain loops on the quantized values.
+#if defined(__AVX512BW__) && defined(__AVX512F__) && !defined(TSS_DOUBLE)
+#define FAST 1
+#include <immintrin.h>
+#else
+#define FAST 0
+#endif
+
+typedef struct {
+    uint64_t *bits;  // per row: d / 64 pairs (plus, minus)
+    real *sc;        // per row: d / group
+} Plane;
+
+typedef struct {
+    int ok;  // the fast path applies (FAST, d and group multiples of 64, value a multiple of 16)
+    Plane w_in, w_out, proj, U;
+} Codes;
+
+static void plane_rows(const real *q, Plane *pl, long r0, long r1, int d, int g) {
+    for (long r = r0; r < r1; r++) {
+        const real *qr = q + r * d;
+        uint64_t *b = pl->bits + r * (d / 32);
+        for (int j = 0; j < d; j += 64) {
+            uint64_t P = 0, Nm = 0;
+            for (int i = 0; i < 64; i++) {
+                P |= (uint64_t)(qr[j + i] > 0) << i;
+                Nm |= (uint64_t)(qr[j + i] < 0) << i;
+            }
+            b[(j / 64) * 2] = P, b[(j / 64) * 2 + 1] = Nm;
+        }
+        for (int j = 0; j < d; j += g) {
+            real m = 0;
+            for (int i = 0; i < g; i++) m = fabs(qr[j + i]) > m ? fabs(qr[j + i]) : m;
+            pl->sc[r * (d / g) + j / g] = m;
+        }
+    }
+}
+
+static Plane plane_new(long rows, int d, int g) {
+    Plane p = {calloc((size_t)rows * (d / 32), sizeof(uint64_t)), calloc((size_t)rows * (d / g), sizeof(real))};
+    return p;
+}
+
+Codes *tss_codes_new(const Cfg *c) {
+    Codes *k = calloc(1, sizeof(Codes));
+    k->ok = FAST && c->d % 64 == 0 && c->group % 64 == 0 && c->p % 16 == 0;
+    if (!k->ok) return k;
+    const long N = NODES(c), L = c->n_layer;
+    k->w_in = plane_new(L * c->T * N, c->d, c->group), k->w_out = plane_new(L * c->T * N, c->d, c->group);
+    k->proj = plane_new(L * PDIM(c), c->d, c->group), k->U = plane_new(L * c->T * c->p, c->d, c->group);
+    return k;
+}
+
+// the planes of every row from the quantized values (after tss_quantize)
+void tss_codes_all(const Cfg *c, const Params *Q, Codes *k) {
+    if (!k || !k->ok) return;
+    const long N = NODES(c), L = c->n_layer;
+    plane_rows(Q->w_in, &k->w_in, 0, L * c->T * N, c->d, c->group);
+    plane_rows(Q->w_out, &k->w_out, 0, L * c->T * N, c->d, c->group);
+    plane_rows(Q->proj, &k->proj, 0, L * PDIM(c), c->d, c->group);
+    plane_rows(Q->U, &k->U, 0, L * c->T * c->p, c->d, c->group);
+}
+
+#if FAST
+static inline float pdot8(const Plane *pl, size_t r, const int8_t *xq, float xs, int d, int g) {
+    const uint64_t *b = pl->bits + r * (d / 32);
+    const float *sc = pl->sc + r * (d / g);
+    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
+    float acc = 0;
+    for (int j = 0; j < d; j += g) {
+        __m512i s32 = _mm512_setzero_si512();
+        for (int i = j; i < j + g; i += 64) {
+            const __m512i x = _mm512_loadu_si512((const void *)(xq + i));
+            __m512i v = _mm512_maskz_mov_epi8(b[(i / 64) * 2], x);
+            v = _mm512_mask_sub_epi8(v, b[(i / 64) * 2 + 1], v, x);
+            s32 = _mm512_add_epi32(s32, _mm512_madd_epi16(_mm512_maddubs_epi16(ones8, v), ones16));
+        }
+        acc += sc[j / g] * (float)_mm512_reduce_add_epi32(s32);
+    }
+    return acc * xs;
+}
+
+static inline float pdotf(const Plane *pl, size_t r, const float *v, int d, int g) {
+    const uint64_t *b = pl->bits + r * (d / 32);
+    const float *sc = pl->sc + r * (d / g);
+    float acc = 0;
+    for (int j = 0; j < d; j += g) {
+        __m512 s = _mm512_setzero_ps();
+        for (int i = j; i < j + g; i += 64) {
+            const uint64_t P = b[(i / 64) * 2], Nm = b[(i / 64) * 2 + 1];
+            for (int q = 0; q < 4; q++) {
+                const __m512 x = _mm512_loadu_ps(v + i + 16 * q);
+                s = _mm512_mask_add_ps(s, (__mmask16)(P >> (16 * q)), s, x);
+                s = _mm512_mask_sub_ps(s, (__mmask16)(Nm >> (16 * q)), s, x);
+            }
+        }
+        acc += sc[j / g] * _mm512_reduce_add_ps(s);
+    }
+    return acc;
+}
+
+static inline void paxpyf(float *y, float a, const Plane *pl, size_t r, int d, int g) {
+    const uint64_t *b = pl->bits + r * (d / 32);
+    const float *sc = pl->sc + r * (d / g);
+    for (int j = 0; j < d; j += g) {
+        const __m512 as = _mm512_set1_ps(a * sc[j / g]);
+        for (int i = j; i < j + g; i += 64) {
+            const uint64_t P = b[(i / 64) * 2], Nm = b[(i / 64) * 2 + 1];
+            for (int q = 0; q < 4; q++) {
+                __m512 yv = _mm512_loadu_ps(y + i + 16 * q);
+                yv = _mm512_mask_add_ps(yv, (__mmask16)(P >> (16 * q)), yv, as);
+                yv = _mm512_mask_sub_ps(yv, (__mmask16)(Nm >> (16 * q)), yv, as);
+                _mm512_storeu_ps(y + i + 16 * q, yv);
+            }
+        }
+    }
+}
+#endif
+
+// <row r of a quantized matrix, x> (x as int8 codes xq times xs on the fast path)
+static inline real qdotx(const Codes *k, const Plane *pl, const real *qm, size_t r, const real *x, const int8_t *xq, real xs,
+                         int d, int g) {
+#if FAST
+    if (k && k->ok) return pdot8(pl, r, xq, xs, d, g);
+#endif
+    (void)k, (void)pl, (void)xq, (void)xs, (void)g;
+    return dotr(qm + r * d, x, d);
+}
+
+// <row r, v>, v float
+static inline real qdotf(const Codes *k, const Plane *pl, const real *qm, size_t r, const real *v, int d, int g) {
+#if FAST
+    if (k && k->ok) return pdotf(pl, r, v, d, g);
+#endif
+    (void)k, (void)pl, (void)g;
+    return dotr(qm + r * d, v, d);
+}
+
+// y += a * row r
+static inline void qaxpy(const Codes *k, const Plane *pl, const real *qm, size_t r, real *y, real a, int d, int g) {
+#if FAST
+    if (k && k->ok) {
+        paxpyf(y, a, pl, r, d, g);
+        return;
+    }
+#endif
+    (void)k, (void)pl, (void)g;
+    const real *row = qm + r * d;
+    for (int i = 0; i < d; i++) y[i] += a * row[i];
+}
+
+static inline void axpy(real *y, real a, const real *x, int d) {
+    for (int i = 0; i < d; i++) y[i] += a * x[i];
+}
+
 typedef struct {  // one layer's tape over a sequence of L tokens
     real *xin, *u, *rn, *x, *p, *dt;   // (L, d) x3, (L), (L, P), (L, T)
+    real *xs;                           // (L): x = xq * xs
+    int8_t *xq;                         // (L, d): the 8-bit activations' codes
     int *node;                          // (L, T, D + 1)
     real *s, *R, *hprev, *decay;        // (L, T, D + 1), (.., p), (.., n * p), (..)
     int *anode;                         // the other subtrees: (L, T, D (D + 1) / 2)
@@ -1809,7 +1977,7 @@ typedef struct {  // one layer's tape over a sequence of L tokens
 
 static size_t tape_reals(const Cfg *c, int L) {
     const size_t V = (size_t)L * c->T * (c->D + 1), A = (size_t)L * c->T * c->D * (c->D + 1) / 2;
-    return (size_t)L * (3 * c->d + 1 + PDIM(c) + c->T) + V * (1 + c->p + c->n * c->p + 1) + A * (1 + c->p);
+    return (size_t)L * (3 * c->d + 2 + PDIM(c) + c->T) + V * (1 + c->p + c->n * c->p + 1) + A * (1 + c->p);
 }
 
 static void tape_carve(const Cfg *c, int L, real *buf, int *ibuf, Tape *tp) {
@@ -1818,6 +1986,7 @@ static void tape_carve(const Cfg *c, int L, real *buf, int *ibuf, Tape *tp) {
     tp->u = buf, buf += (size_t)L * c->d;
     tp->x = buf, buf += (size_t)L * c->d;
     tp->rn = buf, buf += L;
+    tp->xs = buf, buf += L;
     tp->p = buf, buf += (size_t)L * PDIM(c);
     tp->dt = buf, buf += (size_t)L * c->T;
     tp->s = buf, buf += V;
@@ -1836,29 +2005,35 @@ typedef struct {
     real *tapes, *x, *h, *g, *xn, *dxn, *lg, *lam;
     real *ds, *dR, *dp, *dx, *du, *gUr, *on, *Racc, *mx, *y;
     int *itapes;
+    int8_t *xq8;
     Tape *tp;
+    const Codes *k;  // the row codes (the fast path), or NULL
 } Work;
 
 static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int L, real *xres, real *h, Tape *tp, Work *w) {
-    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c);
+    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c), g = c->group;
     const real *norm = P->norm + (size_t)l * d, *conv = P->conv + (size_t)l * K * d;
-    const real *w_in = Q->w_in + (size_t)l * T * N * d, *w_out = Q->w_out + (size_t)l * T * N * d;
-    const real *bias = P->bias + (size_t)l * T * N, *A_log = P->A_log + (size_t)l * T * N;
-    const real *proj = Q->proj + (size_t)l * Pd * d, *dt_bias = P->dt_bias + (size_t)l * T, *U = Q->U + (size_t)l * T * pv * d;
+    const real *bias = P->bias + (size_t)l * T * N, *A_log = P->A_log + (size_t)l * T * N, *dt_bias = P->dt_bias + (size_t)l * T;
+    const size_t r_node = (size_t)l * T * N, r_proj = (size_t)l * Pd, r_U = (size_t)l * T * pv;  // the layer's first rows
+    const Codes *k = w->k;
+    const Plane *pin = k ? &k->w_in : NULL, *pout = k ? &k->w_out : NULL, *pproj = k ? &k->proj : NULL, *pU = k ? &k->U : NULL;
     const int AL = D * (D + 1) / 2;
+#if FAST
+    const int vec = k && k->ok && pv == 16;  // a node state's row is one register
+#endif
     real *mx = w->mx, *y = w->y, *Racc = w->Racc;
     for (int t = 0; t < L; t++) {
         real *xt = tp->x + (size_t)t * d, *ut = tp->u + (size_t)t * d, *pt = tp->p + (size_t)t * Pd, *dtt = tp->dt + (size_t)t * T;
+        int8_t *xq = tp->xq + (size_t)t * d;
         memcpy(tp->xin + (size_t)t * d, xres + (size_t)t * d, sizeof(real) * d);
         rmsnorm_fwd(xres + (size_t)t * d, norm, ut, d, tp->rn + t);
-        for (int i = 0; i < d; i++) {
-            real a = 0;
-            for (int j = 0; j < K; j++)
-                if (t - j >= 0) a += conv[j * d + i] * tp->u[(size_t)(t - j) * d + i];
-            mx[i] = a;
-        }
-        quant8(mx, xt, d);
-        for (int r = 0; r < Pd; r++) pt[r] = dotr(proj + (size_t)r * d, xt, d);
+        for (int i = 0; i < d; i++) mx[i] = conv[i] * ut[i];
+        for (int j = 1; j < K; j++)
+            if (t - j >= 0)
+                for (int i = 0; i < d; i++) mx[i] += conv[j * d + i] * tp->u[(size_t)(t - j) * d + i];
+        quant8(mx, xt, xq, tp->xs + t, d);
+        const real xs = tp->xs[t];
+        for (int r = 0; r < Pd; r++) pt[r] = qdotx(k, pproj, Q->proj, r_proj + r, xt, xq, xs, d, g);
         const real *B = pt, *C = pt + n, *V = pt + 2 * n, *Z = pt + 2 * n + pv;
         for (int tr = 0; tr < T; tr++) dtt[tr] = softplus(pt[2 * n + 2 * pv + tr] + dt_bias[tr]);
         memset(y, 0, sizeof(real) * d);
@@ -1866,44 +2041,65 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
             const size_t vb = ((size_t)t * T + tr) * (D + 1);
             memset(Racc, 0, sizeof(real) * pv);
             int a = 0;
-            for (int k = 0; k <= D; k++) {  // the path: decay, read, branch, output, write
-                const size_t row = (size_t)tr * N + a, v = vb + k;
+            for (int kk = 0; kk <= D; kk++) {  // the path: decay, read, branch, output, write
+                const size_t row = (size_t)tr * N + a, v = vb + kk;
                 real *ha = h + row * n * pv, *R = tp->R + v * pv;
-                const real dec = exp(-exp(A_log[row]) * dtt[tr]);
+                const real dec = exp(-exp(A_log[row]) * dtt[tr]), wdt = dtt[tr];
                 memcpy(tp->hprev + v * n * pv, ha, sizeof(real) * n * pv);
-                for (int q = 0; q < pv; q++) R[q] = 0;
-                for (int j = 0; j < n; j++)
-                    for (int q = 0; q < pv; q++) {
-                        ha[j * pv + q] *= dec;
-                        R[q] += C[j] * ha[j * pv + q];
+#if FAST
+                if (vec) {
+                    const __m512 vd = _mm512_set1_ps(dec), vV = _mm512_loadu_ps(V);
+                    __m512 vR = _mm512_setzero_ps();
+                    for (int j = 0; j < n; j++) {
+                        const __m512 hv = _mm512_mul_ps(_mm512_loadu_ps(ha + j * 16), vd);
+                        vR = _mm512_fmadd_ps(_mm512_set1_ps(C[j]), hv, vR);
+                        _mm512_storeu_ps(ha + j * 16, _mm512_fmadd_ps(_mm512_set1_ps(wdt * B[j]), vV, hv));
                     }
-                real s = dotr(xt, w_in + row * d, d) + bias[row] + dotr(R, Z, pv);
-                const real gs = gelu(s);
-                for (int i = 0; i < d; i++) y[i] += gs * w_out[row * d + i];
+                    _mm512_storeu_ps(R, vR);
+                } else
+#endif
+                {
+                    for (int q = 0; q < pv; q++) R[q] = 0;
+                    for (int j = 0; j < n; j++)
+                        for (int q = 0; q < pv; q++) {
+                            ha[j * pv + q] *= dec;
+                            R[q] += C[j] * ha[j * pv + q];
+                        }
+                    for (int j = 0; j < n; j++)
+                        for (int q = 0; q < pv; q++) ha[j * pv + q] += wdt * B[j] * V[q];
+                }
+                const real s = qdotx(k, pin, Q->w_in, r_node + row, xt, xq, xs, d, g) + bias[row] + dotr(R, Z, pv);
+                qaxpy(k, pout, Q->w_out, r_node + row, y, gelu(s), d, g);
                 for (int q = 0; q < pv; q++) Racc[q] += R[q];
-                for (int j = 0; j < n; j++)
-                    for (int q = 0; q < pv; q++) ha[j * pv + q] += dtt[tr] * B[j] * V[q];
                 tp->node[v] = (int)row, tp->s[v] = s, tp->decay[v] = dec;
                 a = 2 * a + 1 + (s > 0);
             }
-            for (int q = 0; q < pv; q++)
-                for (int i = 0; i < d; i++) y[i] += Racc[q] * U[((size_t)tr * pv + q) * d + i];
+            for (int q = 0; q < pv; q++) qaxpy(k, pU, Q->U, r_U + (size_t)tr * pv + q, y, Racc[q], d, g);
         }
         // the other subtrees (read-only: their states as they stand at t, the token's own arrival decay)
         for (int tr = 0; tr < T; tr++) {
             const size_t vb = ((size_t)t * T + tr) * (D + 1), ab = ((size_t)t * T + tr) * AL;
             int ai = 0;
-            for (int k = 0; k < D; k++) {
-                const int ak = tp->node[vb + k] - tr * N;
-                int cn = 2 * ak + 2 - (tp->s[vb + k] > 0);
-                for (int j = k + 1; j <= D; j++, ai++) {
+            for (int kk = 0; kk < D; kk++) {
+                const int ak = tp->node[vb + kk] - tr * N;
+                int cn = 2 * ak + 2 - (tp->s[vb + kk] > 0);
+                for (int j = kk + 1; j <= D; j++, ai++) {
                     const size_t row = (size_t)tr * N + cn;
-                    const real dec = exp(-exp(A_log[row]) * dtt[tr]);
+                    const real dec = exp(-exp(A_log[row]) * dtt[tr]), *hr = h + row * n * pv;
                     real *R = tp->aR + (ab + ai) * pv;
-                    for (int q = 0; q < pv; q++) R[q] = 0;
-                    for (int jj = 0; jj < n; jj++)
-                        for (int q = 0; q < pv; q++) R[q] += C[jj] * dec * h[row * n * pv + jj * pv + q];
-                    const real s = dotr(xt, w_in + row * d, d) + bias[row] + dotr(R, Z, pv);
+#if FAST
+                    if (vec) {
+                        __m512 vR = _mm512_setzero_ps();
+                        for (int jj = 0; jj < n; jj++) vR = _mm512_fmadd_ps(_mm512_set1_ps(C[jj]), _mm512_loadu_ps(hr + jj * 16), vR);
+                        _mm512_storeu_ps(R, _mm512_mul_ps(vR, _mm512_set1_ps(dec)));
+                    } else
+#endif
+                    {
+                        for (int q = 0; q < pv; q++) R[q] = 0;
+                        for (int jj = 0; jj < n; jj++)
+                            for (int q = 0; q < pv; q++) R[q] += C[jj] * dec * hr[jj * pv + q];
+                    }
+                    const real s = qdotx(k, pin, Q->w_in, r_node + row, xt, xq, xs, d, g) + bias[row] + dotr(R, Z, pv);
                     tp->anode[ab + ai] = (int)row, tp->as[ab + ai] = s;
                     cn = 2 * cn + 1 + (s > 0);
                 }
@@ -1917,16 +2113,19 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
 // lam: (T * N, n * p) adjoint states, zeroed. hit (T * N) node rows touched, set to 1.
 static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G, int l, int L, real *g, real *lam,
                       unsigned char *hit, const Tape *tp, Work *w) {
-    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c);
+    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c), gs = c->group;
     const int AL = D * (D + 1) / 2;
     const real *norm = P->norm + (size_t)l * d, *conv = P->conv + (size_t)l * K * d;
-    const real *w_in = Q->w_in + (size_t)l * T * N * d, *w_out = Q->w_out + (size_t)l * T * N * d;
-    const real *A_log = P->A_log + (size_t)l * T * N;
-    const real *proj = Q->proj + (size_t)l * Pd * d, *dt_bias = P->dt_bias + (size_t)l * T, *U = Q->U + (size_t)l * T * pv * d;
+    const real *A_log = P->A_log + (size_t)l * T * N, *dt_bias = P->dt_bias + (size_t)l * T;
+    const size_t r_node = (size_t)l * T * N, r_proj = (size_t)l * Pd, r_U = (size_t)l * T * pv;
     real *gnorm = G->norm + (size_t)l * d, *gconv = G->conv + (size_t)l * K * d;
-    real *gw_in = G->w_in + (size_t)l * T * N * d, *gw_out = G->w_out + (size_t)l * T * N * d;
-    real *gbias = G->bias + (size_t)l * T * N, *gA = G->A_log + (size_t)l * T * N;
-    real *gproj = G->proj + (size_t)l * Pd * d, *gdtb = G->dt_bias + (size_t)l * T, *gU = G->U + (size_t)l * T * pv * d;
+    real *gw_in = G->w_in + r_node * d, *gw_out = G->w_out + r_node * d, *gbias = G->bias + r_node, *gA = G->A_log + r_node;
+    real *gproj = G->proj + r_proj * d, *gdtb = G->dt_bias + (size_t)l * T, *gU = G->U + r_U * d;
+    const Codes *k = w->k;
+    const Plane *pin = k ? &k->w_in : NULL, *pout = k ? &k->w_out : NULL, *pproj = k ? &k->proj : NULL, *pU = k ? &k->U : NULL;
+#if FAST
+    const int vec = k && k->ok && pv == 16;
+#endif
     const size_t V = (size_t)L * T * (D + 1);
     real *ds = w->ds, *dR = w->dR, *dp = w->dp, *dx = w->dx, *gUr = w->gUr, *on = w->on, *Racc = w->Racc;
     memset(ds, 0, sizeof(real) * V), memset(dR, 0, sizeof(real) * V * pv);
@@ -1935,75 +2134,91 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
     for (int t = 0; t < L; t++) {
         const real *gy = g + (size_t)t * d, *xt = tp->x + (size_t)t * d, *pt = tp->p + (size_t)t * Pd;
         const real *Z = pt + 2 * n + pv;
-        real *dZ = dp + (size_t)t * Pd + 2 * n + pv;
+        real *dZ = dp + (size_t)t * Pd + 2 * n + pv, *dxt = dx + (size_t)t * d;
         for (int tr = 0; tr < T; tr++) {
             const size_t vb = ((size_t)t * T + tr) * (D + 1), ab = ((size_t)t * T + tr) * AL;
-            const real *Ut = U + (size_t)tr * pv * d;
             memset(Racc, 0, sizeof(real) * pv);
-            for (int k = 0; k <= D; k++)
-                for (int q = 0; q < pv; q++) Racc[q] += tp->R[(vb + k) * pv + q];
+            for (int kk = 0; kk <= D; kk++)
+                for (int q = 0; q < pv; q++) Racc[q] += tp->R[(vb + kk) * pv + q];
             for (int q = 0; q < pv; q++) {
-                gUr[q] = dotr(Ut + (size_t)q * d, gy, d);
-                for (int i = 0; i < d; i++) gU[((size_t)tr * pv + q) * d + i] += Racc[q] * gy[i];
+                gUr[q] = qdotf(k, pU, Q->U, r_U + (size_t)tr * pv + q, gy, d, gs);
+                axpy(gU + ((size_t)tr * pv + q) * d, Racc[q], gy, d);
             }
-            for (int k = 0; k <= D; k++) {  // each path node's output, <g, out>, and its own gradients
-                const size_t v = vb + k, row = tp->node[v];
-                const real s = tp->s[v], go = dotr(gy, w_out + row * d, d);
-                on[k] = gelu(s) * go + dotr(gUr, tp->R + v * pv, pv);
-                for (int i = 0; i < d; i++) gw_out[row * d + i] += gelu(s) * gy[i];
+            for (int kk = 0; kk <= D; kk++) {  // each path node's output, <g, out>, and its own gradients
+                const size_t v = vb + kk, row = tp->node[v];
+                const real s = tp->s[v], go = qdotf(k, pout, Q->w_out, r_node + row, gy, d, gs);
+                on[kk] = gelu(s) * go + dotr(gUr, tp->R + v * pv, pv);
+                axpy(gw_out + row * d, gelu(s), gy, d);
                 ds[v] += dgelu(s) * go;
                 for (int q = 0; q < pv; q++) dR[v * pv + q] += gUr[q];
                 hit[row] = 1;
             }
             int ai = 0;
-            for (int k = 0; k < D; k++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp
+            for (int kk = 0; kk < D; kk++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp
                 real onk = 0, alt = 0;
-                for (int j = k + 1; j <= D; j++) onk += on[j];
-                for (int j = k + 1; j <= D; j++, ai++) {
+                for (int j = kk + 1; j <= D; j++) onk += on[j];
+                for (int j = kk + 1; j <= D; j++, ai++) {
                     const size_t a = ab + ai, row = tp->anode[a];
-                    alt += gelu(tp->as[a]) * dotr(gy, w_out + row * d, d) + dotr(gUr, tp->aR + a * pv, pv);
+                    alt += gelu(tp->as[a]) * qdotf(k, pout, Q->w_out, r_node + row, gy, d, gs) + dotr(gUr, tp->aR + a * pv, pv);
                 }
-                const real s = tp->s[vb + k], sg = sigm(fabs(s) / c->temp);
-                ds[vb + k] += (s > 0 ? 1 : -1) * (onk - alt) * sg * (1 - sg) / c->temp;
+                const real s = tp->s[vb + kk], sg = sigm(fabs(s) / c->temp);
+                ds[vb + kk] += (s > 0 ? 1 : -1) * (onk - alt) * sg * (1 - sg) / c->temp;
             }
-            for (int k = 0; k <= D; k++) {  // s = <x, w_in> + bias + <Z, R>
-                const size_t v = vb + k, row = tp->node[v];
+            for (int kk = 0; kk <= D; kk++) {  // s = <x, w_in> + bias + <Z, R>
+                const size_t v = vb + kk, row = tp->node[v];
                 const real dsv = ds[v];
                 for (int q = 0; q < pv; q++) {
                     dZ[q] += dsv * tp->R[v * pv + q];
                     dR[v * pv + q] += dsv * Z[q];
                 }
-                for (int i = 0; i < d; i++) {
-                    gw_in[row * d + i] += dsv * xt[i];
-                    dx[(size_t)t * d + i] += dsv * w_in[row * d + i];
-                }
-                G->bias[(size_t)l * T * N + row] += dsv;
+                axpy(gw_in + row * d, dsv, xt, d);
+                qaxpy(k, pin, Q->w_in, r_node + row, dxt, dsv, d, gs);
+                gbias[row] += dsv;
             }
         }
     }
-    (void)gbias;
     // B: the node states backward in time; per visit: h~ = decay h_prev, R = C^T h~, h = h~ + dt B V^T
     for (int t = L - 1; t >= 0; t--) {
         const real *pt = tp->p + (size_t)t * Pd, *B = pt, *C = pt + n, *Vv = pt + 2 * n;
         real *dpt = dp + (size_t)t * Pd, *dB = dpt, *dC = dpt + n, *dV = dpt + 2 * n, *ddt = dpt + 2 * n + 2 * pv;
         for (int tr = 0; tr < T; tr++) {
             const real dtv = tp->dt[(size_t)t * T + tr];
-            for (int k = 0; k <= D; k++) {
-                const size_t v = ((size_t)t * T + tr) * (D + 1) + k, row = tp->node[v];
+            for (int kk = 0; kk <= D; kk++) {
+                const size_t v = ((size_t)t * T + tr) * (D + 1) + kk, row = tp->node[v];
                 real *la = lam + row * n * pv;
                 const real *hp = tp->hprev + v * n * pv, dec = tp->decay[v], *dRv = dR + v * pv;
                 real ddec = 0;
-                for (int j = 0; j < n; j++)
-                    for (int q = 0; q < pv; q++) {
-                        const real lv = la[j * pv + q];
-                        dB[j] += dtv * lv * Vv[q];
-                        dV[q] += dtv * lv * B[j];
-                        ddt[tr] += lv * B[j] * Vv[q];
-                        dC[j] += dec * hp[j * pv + q] * dRv[q];
-                        const real dht = lv + C[j] * dRv[q];  // dL/dh~
-                        ddec += dht * hp[j * pv + q];
-                        la[j * pv + q] = dec * dht;  // dL/dh at the node's previous visit
+#if FAST
+                if (vec) {
+                    const __m512 vV = _mm512_loadu_ps(Vv), vdR = _mm512_loadu_ps(dRv), vd = _mm512_set1_ps(dec);
+                    __m512 vBl = _mm512_setzero_ps(), vdec = _mm512_setzero_ps();
+                    for (int j = 0; j < n; j++) {
+                        const __m512 lv = _mm512_loadu_ps(la + j * 16), hv = _mm512_loadu_ps(hp + j * 16);
+                        dB[j] += dtv * _mm512_reduce_add_ps(_mm512_mul_ps(lv, vV));
+                        vBl = _mm512_fmadd_ps(_mm512_set1_ps(B[j]), lv, vBl);
+                        dC[j] += dec * _mm512_reduce_add_ps(_mm512_mul_ps(hv, vdR));
+                        const __m512 dht = _mm512_fmadd_ps(_mm512_set1_ps(C[j]), vdR, lv);
+                        vdec = _mm512_fmadd_ps(dht, hv, vdec);
+                        _mm512_storeu_ps(la + j * 16, _mm512_mul_ps(vd, dht));
                     }
+                    _mm512_storeu_ps(dV, _mm512_fmadd_ps(_mm512_set1_ps(dtv), vBl, _mm512_loadu_ps(dV)));
+                    ddt[tr] += _mm512_reduce_add_ps(_mm512_mul_ps(vBl, vV));
+                    ddec = _mm512_reduce_add_ps(vdec);
+                } else
+#endif
+                {
+                    for (int j = 0; j < n; j++)
+                        for (int q = 0; q < pv; q++) {
+                            const real lv = la[j * pv + q];
+                            dB[j] += dtv * lv * Vv[q];
+                            dV[q] += dtv * lv * B[j];
+                            ddt[tr] += lv * B[j] * Vv[q];
+                            dC[j] += dec * hp[j * pv + q] * dRv[q];
+                            const real dht = lv + C[j] * dRv[q];  // dL/dh~
+                            ddec += dht * hp[j * pv + q];
+                            la[j * pv + q] = dec * dht;  // dL/dh at the node's previous visit
+                        }
+                }
                 const real ea = exp(A_log[row]);
                 gA[row] += ddec * dec * -ea * dtv;
                 ddt[tr] += ddec * dec * -ea;
@@ -2015,30 +2230,26 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
     memset(du, 0, sizeof(real) * (size_t)L * d);
     for (int t = 0; t < L; t++) {
         const real *pt = tp->p + (size_t)t * Pd, *xt = tp->x + (size_t)t * d;
-        real *dpt = dp + (size_t)t * Pd;
+        real *dpt = dp + (size_t)t * Pd, *dxt = dx + (size_t)t * d;
         for (int tr = 0; tr < T; tr++) {  // dt = softplus(raw + dt_bias)
             const real z = pt[2 * n + 2 * pv + tr] + dt_bias[tr];
             const real dz = dpt[2 * n + 2 * pv + tr] * (z > 20 ? 1 : sigm(z));
             dpt[2 * n + 2 * pv + tr] = dz;
             gdtb[tr] += dz;
         }
-        for (int r = 0; r < Pd; r++)
-            for (int i = 0; i < d; i++) {
-                gproj[(size_t)r * d + i] += dpt[r] * xt[i];
-                dx[(size_t)t * d + i] += dpt[r] * proj[(size_t)r * d + i];
-            }
+        for (int r = 0; r < Pd; r++) {
+            axpy(gproj + (size_t)r * d, dpt[r], xt, d);
+            qaxpy(k, pproj, Q->proj, r_proj + r, dxt, dpt[r], d, gs);
+        }
         for (int j = 0; j < K; j++)
             if (t - j >= 0)
                 for (int i = 0; i < d; i++) {
-                    gconv[j * d + i] += dx[(size_t)t * d + i] * tp->u[(size_t)(t - j) * d + i];
-                    du[(size_t)(t - j) * d + i] += conv[j * d + i] * dx[(size_t)t * d + i];
+                    gconv[j * d + i] += dxt[i] * tp->u[(size_t)(t - j) * d + i];
+                    du[(size_t)(t - j) * d + i] += conv[j * d + i] * dxt[i];
                 }
     }
     for (int t = 0; t < L; t++) rmsnorm_bwd(tp->xin + (size_t)t * d, norm, tp->rn[t], du + (size_t)t * d, g + (size_t)t * d, gnorm, d);
 }
-
-// A workspace for sequences of up to Lmax tokens, allocated once and reused (fresh allocations of this size cost page
-// faults on every call).
 
 Work *tss_work_new(const Cfg *c, int Lmax) {
     const int d = c->d, N = NODES(c), T = c->T, nl = c->n_layer;
@@ -2057,23 +2268,28 @@ Work *tss_work_new(const Cfg *c, int Lmax) {
     w->dx = calloc((size_t)Lmax * d, sizeof(real)), w->du = calloc((size_t)Lmax * d, sizeof(real));
     w->gUr = calloc(c->p, sizeof(real)), w->on = calloc(c->D + 1, sizeof(real)), w->Racc = calloc(c->p, sizeof(real));
     w->mx = calloc(d, sizeof(real)), w->y = calloc(d, sizeof(real));
-    for (int l = 0; l < nl; l++) tape_carve(c, Lmax, w->tapes + tr * l, w->itapes + ti * l, w->tp + l);
+    w->xq8 = calloc((size_t)nl * Lmax * d, 1);
+    for (int l = 0; l < nl; l++) {
+        tape_carve(c, Lmax, w->tapes + tr * l, w->itapes + ti * l, w->tp + l);
+        w->tp[l].xq = w->xq8 + (size_t)l * Lmax * d;
+    }
     return w;
 }
 
 void tss_work_free(Work *w) {
     free(w->tapes), free(w->itapes), free(w->tp), free(w->x), free(w->g), free(w->h), free(w->lam), free(w->xn);
     free(w->dxn), free(w->lg), free(w->ds), free(w->dR), free(w->dp), free(w->dx), free(w->du), free(w->gUr);
-    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w);
+    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w->xq8), free(w);
 }
 
 // One sequence: tokens (L), labels (L, -100 = unscored). Adds the sequence's summed cross-entropy gradients into G
 // (Params-shaped, zeroed by the caller) and its node-row hits into hit (n_layer * T * N bytes). Returns the summed loss;
 // *n_scored = the scored tokens. Q: the quantized weights (tss_quantize).
 real tss_train_seq(const Cfg *c, const Params *P, const Params *Q, Params *G, const int *tokens, const int *labels, int L,
-                   unsigned char *hit, int *n_scored, Work *w) {
+                   unsigned char *hit, int *n_scored, Work *w, const Codes *k) {
     const int d = c->d, N = NODES(c), T = c->T, nl = c->n_layer;
     if (L > w->Lmax) return NAN;
+    w->k = k;
     Tape *tp = w->tp;  // carved for Lmax tokens: the strides are Lmax's, which L <= Lmax respects
     real *x = w->x, *h = w->h;
     for (int t = 0; t < L; t++) memcpy(x + (size_t)t * d, P->embed + (size_t)tokens[t] * d, sizeof(real) * d);
@@ -2154,11 +2370,12 @@ static void adam(real *p, real *g, real *m, real *v, size_t n, const Hyper *h, r
 
 real tss_train_step(const Cfg *c, Params *P, Params *Q, Params *G, unsigned char *hit, Params *M, Params *Vm,
                     Params *Gt, unsigned char *hits, Work **ws, int threads, const int *tokens, const int *labels, int B,
-                    int L, const Hyper *h) {
+                    int L, const Hyper *h, Codes *k) {
     const size_t rows = (size_t)c->n_layer * c->T * NODES(c);
     const int d = c->d;
     real loss = 0;
     int scored = 0;
+    if (threads > 64) return NAN;  // the threads' buffers are tabled for at most 64
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 1) reduction(+ : loss, scored)
     for (int b = 0; b < B; b++) {
 #ifdef _OPENMP
@@ -2167,43 +2384,53 @@ real tss_train_step(const Cfg *c, Params *P, Params *Q, Params *G, unsigned char
         const int th = 0;
 #endif
         int ns = 0;
-        loss += tss_train_seq(c, P, Q, Gt + th, tokens + (size_t)b * L, labels + (size_t)b * L, L, hits + rows * th, &ns, ws[th]);
+        loss += tss_train_seq(c, P, Q, Gt + th, tokens + (size_t)b * L, labels + (size_t)b * L, L, hits + rows * th, &ns, ws[th], k);
         scored += ns;
     }
     size_t z[N_FIELDS];
     sizes(c, z);
     real *gf[N_FIELDS], *pf[N_FIELDS], *mf[N_FIELDS], *vf[N_FIELDS];
     fields(G, gf), fields(P, pf), fields(M, mf), fields(Vm, vf);
-    // sum the threads' buffers into G (touched rows only for the node tensors), zeroing them
-    memset(hit, 0, rows);
-    for (int th = 0; th < threads; th++)
-        for (size_t r = 0; r < rows; r++) hit[r] |= hits[rows * th + r];
-    for (int th = 0; th < threads; th++) {
-        real *tf[N_FIELDS];
-        fields(Gt + th, tf);
-        for (int f = 0; f < N_FIELDS; f++) {
-            if (node_field(f)) {
-                const size_t w = z[f] / rows;  // d for w_in / w_out, 1 for bias / A_log
-                for (size_t r = 0; r < rows; r++)
-                    if (hit[r])
-                        for (size_t i = 0; i < w; i++) gf[f][r * w + i] += tf[f][r * w + i], tf[f][r * w + i] = 0;
-            } else {
-                for (size_t i = 0; i < z[f]; i++) gf[f][i] += tf[f][i], tf[f][i] = 0;
-            }
+    // sum the threads' buffers into G (touched rows only for the node tensors), zeroing them; every loop below is
+    // parallel over rows or elements (at a large batch most rows are touched: the update is as dense as the model)
+    const long R = (long)rows;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (long r = 0; r < R; r++) {
+        unsigned char any = 0;
+        for (int th = 0; th < threads; th++) any |= hits[rows * th + r], hits[rows * th + r] = 0;
+        hit[r] = any;
+    }
+    real *tf[64][N_FIELDS];
+    for (int th = 0; th < threads && th < 64; th++) fields(Gt + th, tf[th]);
+    for (int f = 0; f < N_FIELDS; f++) {
+        if (node_field(f)) {
+            const size_t w = z[f] / rows;  // d for w_in / w_out, 1 for bias / A_log
+#pragma omp parallel for num_threads(threads) schedule(static)
+            for (long r = 0; r < R; r++)
+                if (hit[r])
+                    for (int th = 0; th < threads; th++)
+                        for (size_t i = 0; i < w; i++) gf[f][r * w + i] += tf[th][f][r * w + i], tf[th][f][r * w + i] = 0;
+        } else {
+            const long Z = (long)z[f];
+#pragma omp parallel for num_threads(threads) schedule(static)
+            for (long i = 0; i < Z; i++)
+                for (int th = 0; th < threads; th++) gf[f][i] += tf[th][f][i], tf[th][f][i] = 0;
         }
-        memset(hits + rows * th, 0, rows);
     }
     // the mean over scored tokens, then the global norm's clip
     const real inv = scored ? (real)1 / scored : 0;
-    real nrm = 0;
+    double nrm = 0;
     for (int f = 0; f < N_FIELDS; f++) {
         if (node_field(f)) {
             const size_t w = z[f] / rows;
-            for (size_t r = 0; r < rows; r++)
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(+ : nrm)
+            for (long r = 0; r < R; r++)
                 if (hit[r])
-                    for (size_t i = 0; i < w; i++) nrm += gf[f][r * w + i] * gf[f][r * w + i];
+                    for (size_t i = 0; i < w; i++) nrm += (double)gf[f][r * w + i] * gf[f][r * w + i];
         } else {
-            for (size_t i = 0; i < z[f]; i++) nrm += gf[f][i] * gf[f][i];
+            const long Z = (long)z[f];
+#pragma omp parallel for num_threads(threads) schedule(static) reduction(+ : nrm)
+            for (long i = 0; i < Z; i++) nrm += (double)gf[f][i] * gf[f][i];
         }
     }
     nrm = sqrt(nrm) * inv;
@@ -2212,20 +2439,36 @@ real tss_train_step(const Cfg *c, Params *P, Params *Q, Params *G, unsigned char
     for (int f = 0; f < N_FIELDS; f++) {
         if (node_field(f)) {
             const size_t w = z[f] / rows;
-            for (size_t r = 0; r < rows; r++)
+#pragma omp parallel for num_threads(threads) schedule(static)
+            for (long r = 0; r < R; r++)
                 if (hit[r]) adam(pf[f] + r * w, gf[f] + r * w, mf[f] + r * w, vf[f] + r * w, w, h, scale);
         } else {
-            adam(pf[f], gf[f], mf[f], vf[f], z[f], h, scale);
+            const long Z = (long)z[f], chunk = 4096;
+#pragma omp parallel for num_threads(threads) schedule(static)
+            for (long i = 0; i < Z; i += chunk)
+                adam(pf[f] + i, gf[f] + i, mf[f] + i, vf[f] + i, (size_t)(i + chunk < Z ? chunk : Z - i), h, scale);
         }
     }
     // the codes: the touched node rows, the dense matrices
-    for (size_t r = 0; r < rows; r++)
+    const int kok = k && k->ok;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (long r = 0; r < R; r++)
         if (hit[r]) {
             tss_ternary(P->w_in + r * d, Q->w_in + r * d, 1, d, c->group);
             tss_ternary(P->w_out + r * d, Q->w_out + r * d, 1, d, c->group);
+            if (kok) {
+                plane_rows(Q->w_in, &k->w_in, r, r + 1, d, c->group);
+                plane_rows(Q->w_out, &k->w_out, r, r + 1, d, c->group);
+            }
         }
-    tss_ternary(P->proj, Q->proj, (long)c->n_layer * PDIM(c), d, c->group);
-    tss_ternary(P->U, Q->U, (long)c->n_layer * c->T * c->p, d, c->group);
+    const long pr = (long)c->n_layer * PDIM(c), ur = (long)c->n_layer * c->T * c->p;
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (long r = 0; r < pr + ur; r++) {
+        real *Pm = r < pr ? P->proj : P->U, *Qm = r < pr ? Q->proj : Q->U;
+        const long rr = r < pr ? r : r - pr;
+        tss_ternary(Pm + rr * d, Qm + rr * d, 1, d, c->group);
+        if (kok) plane_rows(Qm, r < pr ? &k->proj : &k->U, rr, rr + 1, d, c->group);
+    }
     return scored ? loss / scored : 0;
 }
 """
@@ -2246,7 +2489,7 @@ class CTrainer:
 
     NAMES = ["embed", "norm_f", "norm", "conv", "w_in", "bias", "w_out", "A_log", "proj", "dt_bias", "U"]
 
-    def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False):
+    def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False, fast=True):
         import ctypes
 
         import numpy as np
@@ -2254,7 +2497,7 @@ class CTrainer:
         c = model.cfg
         assert c.readout == "tree" and c.memory and c.ternary and c.act_bits == 8, "the C trainer: readout tree, ternary, 8-bit"
         self.np, self.ct = np, ctypes
-        flags = ("-DREAL=double",) if double else ()
+        flags = ("-DREAL=double", "-DTSS_DOUBLE") if double else ()
         lib = self.lib = ctypes.CDLL(build_c(C_TRAIN_SOURCE, "train", flags))
         R = ctypes.c_double if double else ctypes.c_float
         self.dtype = np.float64 if double else np.float32
@@ -2274,10 +2517,14 @@ class CTrainer:
         lib.tss_work_new.argtypes = [ctypes.POINTER(Cfg), ctypes.c_int]
         lib.tss_quantize.argtypes = [ctypes.POINTER(Cfg), PP, PP]
         lib.tss_train_seq.restype = R
-        lib.tss_train_seq.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, PI, PI, ctypes.c_int, P8, PI, ctypes.c_void_p]
+        lib.tss_train_seq.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, PI, PI, ctypes.c_int, P8, PI, ctypes.c_void_p,
+                                      ctypes.c_void_p]
+        lib.tss_codes_new.restype = ctypes.c_void_p
+        lib.tss_codes_new.argtypes = [ctypes.POINTER(Cfg)]
+        lib.tss_codes_all.argtypes = [ctypes.POINTER(Cfg), PP, ctypes.c_void_p]
         lib.tss_train_step.restype = R
         lib.tss_train_step.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, P8, PP, PP, PP, P8, ctypes.POINTER(ctypes.c_void_p),
-                                       ctypes.c_int, PI, PI, ctypes.c_int, ctypes.c_int, ctypes.POINTER(Hyper)]
+                                       ctypes.c_int, PI, PI, ctypes.c_int, ctypes.c_int, ctypes.POINTER(Hyper), ctypes.c_void_p]
         self.cfg = Cfg(c.vocab_size, c.d_model, c.n_layer, c.trees, c.depth, c.state, c.value, c.d_conv,
                        group_size(c.d_model, c.ternary_group), c.temp)
         tensors = _c_tensors(model)
@@ -2288,6 +2535,8 @@ class CTrainer:
         self.grads, self.q, self.m, self.v = zeros(), zeros(), zeros(), zeros()
         self.P, self.G, self.Q, self.M, self.V = mk(self.arrays), mk(self.grads), mk(self.q), mk(self.m), mk(self.v)
         lib.tss_quantize(ctypes.byref(self.cfg), ctypes.byref(self.P), ctypes.byref(self.Q))
+        self.codes = lib.tss_codes_new(ctypes.byref(self.cfg)) if fast else None  # the rows' 2-bit planes (fast path)
+        lib.tss_codes_all(ctypes.byref(self.cfg), ctypes.byref(self.Q), self.codes)
         rows = c.n_layer * c.trees * (2 ** (c.depth + 1) - 1)
         self.hit = np.zeros(rows, dtype=np.uint8)
         self.threads = threads
@@ -2312,7 +2561,7 @@ class CTrainer:
         ns = self.ct.c_int()
         return self.lib.tss_train_seq(self.ct.byref(self.cfg), self.ct.byref(self.P), self.ct.byref(self.Q), self.ct.byref(self.G),
                                       self._ptr(tok, self.ct.c_int), self._ptr(lab, self.ct.c_int), len(tok),
-                                      self._ptr(self.hit, self.ct.c_uint8), self.ct.byref(ns), self.ws[0])
+                                      self._ptr(self.hit, self.ct.c_uint8), self.ct.byref(ns), self.ws[0], self.codes)
 
     def step(self, tokens, labels, lr):
         """One AdamW step on a batch, tokens and labels (B, L); returns the mean loss over the scored tokens."""
@@ -2323,7 +2572,7 @@ class CTrainer:
         b = self.ct.byref
         return self.lib.tss_train_step(b(self.cfg), b(self.P), b(self.Q), b(self.G), self._ptr(self.hit, self.ct.c_uint8),
                                        b(self.M), b(self.V), self.Gt, self._ptr(self.hits, self.ct.c_uint8), self.ws, self.threads,
-                                       self._ptr(tok, self.ct.c_int), self._ptr(lab, self.ct.c_int), B, L, b(self.hp))
+                                       self._ptr(tok, self.ct.c_int), self._ptr(lab, self.ct.c_int), B, L, b(self.hp), self.codes)
 
 
 def selftest_c():
