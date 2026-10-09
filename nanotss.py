@@ -61,6 +61,7 @@ the C steps against the recurrence and times them.
 
     python nanotss.py selftest [--kernels | --c]  # --kernels without a GPU: TRITON_INTERPRET=1 (slow)
     python nanotss.py mqar [--engine torch|c] [--float] [--no-memory] [--depth 0] [--readout level|tree|layer]
+    python nanotss.py lm --data input.txt [--engine c|torch]   # a byte-level language model, sampled at the end
     python nanotss.py bench                   # C inference vs the recurrence, then tokens/s
 
 Results so far (one seed each)
@@ -88,6 +89,10 @@ in lockstep with prefetch (36 independent walks a token at 4 trees of depth 9, t
 node rows' weight gradients summed in row order, the optimizer parallel over rows (at a batch of 2,048 tokens 89% of the node
 rows are touched: per token the update is sparse, per batch it is not). MQAR with --engine c on 4 threads: recall
 0.968 at 2,000 steps in 30 s (PyTorch: 0.983 in 645 s on 2).
+Tiny Shakespeare, byte level (lm, defaults: 1.16M parameters, d 128, 4 layers x 4 trees of depth 7, batch 16 x 256,
+5,000 steps = 20.5M tokens), trained by the sparse C step on 4 CPU threads in 12.3 min (27.8K tokens/s): held-out
+1.594 nats a byte (2.30 bits), from 2.09 at step 250; train 1.34. (For scale, not a matched comparison: nanoGPT's
+character-level Shakespeare, a 10.7M-parameter transformer on a GPU, reaches 1.47.)
 Hard routing turns float32 rounding into an occasional different branch (an activation within rounding of zero), as in
 GTS: the C kernels agree with each other to rounding, and with PyTorch but for such tokens.
 """
@@ -2676,6 +2681,78 @@ def selftest_c():
     print("selftest --c passed")
 
 
+# ---------------------------------------------------------------------------------------------------------------- lm
+
+
+def lm(a):
+    """A byte-level language model on a text file (the last tenth held out): trained by the C sparse step (or PyTorch),
+    evaluated on fixed held-out windows (cross-entropy in nats a byte, as nanoGPT's character-level Shakespeare), then
+    sampled by the C inference step."""
+    import numpy as np
+
+    torch.manual_seed(a.seed)
+    torch.set_num_threads(a.threads)
+    raw = np.frombuffer(open(a.data, "rb").read(), dtype=np.uint8)
+    split = int(len(raw) * 0.9)
+    train, held = torch.from_numpy(raw[:split].astype(np.int64)), torch.from_numpy(raw[split:].astype(np.int64))
+    cfg = Config(vocab_size=256, d_model=a.d_model, n_layer=a.layers, trees=a.trees, depth=a.depth, state=a.state,
+                 value=a.value)
+    model = TSS(cfg)
+    trainer = CTrainer(model, threads=a.threads, lr=a.lr, Lmax=a.seq_len) if a.engine == "c" else None
+    opt = None if trainer else torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.98), weight_decay=0.01)
+    print(f"tss lm ({a.engine}): {a.data} ({len(train):,} bytes to train on, {len(held):,} held out), "
+          f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters, d {a.d_model}, {a.layers} layers x "
+          f"{a.trees} trees of depth {a.depth}, batch {a.batch} x {a.seq_len}", flush=True)
+
+    def windows(data, n, gen):
+        starts = torch.randint(0, len(data) - a.seq_len - 1, (n,), generator=gen)
+        chunk = data[starts[:, None] + torch.arange(a.seq_len + 1)]
+        return chunk[:, :-1], chunk[:, 1:]
+
+    val = windows(held, a.eval_windows, torch.Generator().manual_seed(1234))
+
+    @torch.no_grad()
+    def evaluate():
+        x, y = val
+        return sum(F.cross_entropy(model(x[i : i + 8]).flatten(0, 1), y[i : i + 8].flatten(), reduction="sum").item()
+                   for i in range(0, len(x), 8)) / y.numel()
+
+    gen, t0, seen = torch.Generator().manual_seed(a.seed), time.time(), 0
+    for step in range(1, a.steps + 1):
+        lr = a.lr * min(1.0, step / a.warmup) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.steps)))
+        x, y = windows(train, a.batch, gen)
+        if trainer:
+            loss = trainer.step(x.numpy(), y.numpy(), lr)
+        else:
+            for g in opt.param_groups:
+                g["lr"] = lr
+            out = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
+            opt.zero_grad(set_to_none=True)
+            out.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            loss = out.item()
+        seen += x.numel()
+        if step % a.eval_every == 0 or step == a.steps:
+            el = time.time() - t0
+            v = evaluate()
+            print(f"  step {step:5d}  train {loss:.3f}  held-out {v:.3f} nats/byte ({v / math.log(2):.2f} bits)  "
+                  f"{seen / 1e6:.1f}M tokens  {el / 60:.1f} min  {seen / el:,.0f} tokens/s", flush=True)
+    if a.sample:  # the trained model, sampled by the C inference step
+        st = c_step(model)
+        state, logits = st.new_state(), np.zeros(256, dtype=np.float32)
+        rng = np.random.default_rng(a.seed)
+        out = list(b"\n")
+        st.run(np.array(out, dtype=np.int64), state, logits)
+        for _ in range(a.sample):
+            p = np.exp((logits - logits.max()) / a.temperature)
+            nxt = int(rng.choice(256, p=p / p.sum()))
+            out.append(nxt)
+            st(nxt, state, logits)
+        print("--- sample (C inference step, temperature %.1f) ---" % a.temperature)
+        print(bytes(out).decode("utf-8", "replace"))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2701,6 +2778,26 @@ def main():
     m.add_argument("--eval-every", type=int, default=200)
     m.add_argument("--threads", type=int, default=4)
     m.add_argument("--seed", type=int, default=0)
+    lmp = sub.add_parser("lm", help="a byte-level language model on a text file")
+    lmp.add_argument("--data", required=True)
+    lmp.add_argument("--engine", default="c", choices=["torch", "c"])
+    lmp.add_argument("--d-model", type=int, default=128)
+    lmp.add_argument("--layers", type=int, default=4)
+    lmp.add_argument("--trees", type=int, default=4)
+    lmp.add_argument("--depth", type=int, default=7)
+    lmp.add_argument("--state", type=int, default=16)
+    lmp.add_argument("--value", type=int, default=16)
+    lmp.add_argument("--steps", type=int, default=3000)
+    lmp.add_argument("--batch", type=int, default=16)
+    lmp.add_argument("--seq-len", type=int, default=256)
+    lmp.add_argument("--lr", type=float, default=3e-3)
+    lmp.add_argument("--warmup", type=int, default=100)
+    lmp.add_argument("--eval-every", type=int, default=250)
+    lmp.add_argument("--eval-windows", type=int, default=64)
+    lmp.add_argument("--threads", type=int, default=4)
+    lmp.add_argument("--seed", type=int, default=0)
+    lmp.add_argument("--sample", type=int, default=600, help="bytes to sample at the end (0: none)")
+    lmp.add_argument("--temperature", type=float, default=0.8)
     bn = sub.add_parser("bench")
     bn.add_argument("--vocab", type=int, default=256)
     bn.add_argument("--d-model", type=int, default=256)
@@ -2713,7 +2810,7 @@ def main():
     bn.add_argument("--tokens", type=int, default=20000)
     a = p.parse_args()
     {"selftest": lambda a: selftest_kernels() if a.kernels else selftest_c() if a.c else selftest(), "mqar": mqar,
-     "bench": bench}[a.cmd](a)
+     "lm": lm, "bench": bench}[a.cmd](a)
 
 
 if __name__ == "__main__":
