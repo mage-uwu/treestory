@@ -53,6 +53,10 @@ Three forms of one function
   dot products and row updates are masked adds and subtracts, and a node state's row is one register. The tape of
   previous states (the largest thing the forward writes) is kept in bfloat16 there (``tape_bf16``; gradients within
   ~1e-3 of the float tape's, 10% faster on one thread, 6% on four).
+  The branch gradient follows the other subtree all the way down. Capping it (comparing only the next r levels of
+  both subtrees) was tried and removed: on Tiny Shakespeare (5,000 steps, one seed, 4 threads) held-out 1.594
+  nats/byte full in 12.3 min, 1.633 at r = 2 in 10.0 min, 1.653 at r = 1 in 9.1 min; the full gradient is ahead at
+  equal wall time too.
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
