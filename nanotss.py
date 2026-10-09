@@ -81,9 +81,11 @@ Training cost per token is flat in length (PyTorch on 4 CPU threads, 2 layers, d
 4,096 tokens). The Triton kernels match PyTorch in the interpreter (logits 2e-7, gradients <= 1.5e-4); their speed on a
 GPU is unmeasured. Not yet trained on language.
 Training on a CPU, the sparse C step against PyTorch (forward, backward, AdamW; same model, same CPU): 14 - 16x on one
-thread, 19 - 22x on four (recall-size model: 97K tokens/s on 4 threads; 12.9M parameters: 427 us/token on one thread,
-8.3K tokens/s on four). The rows as 2-bit planes (masked integer and float add/subtract), the node states' rows as
-AVX-512 registers forward and backward, the optimizer parallel over rows (at a batch of 2,048 tokens 89% of the node
+thread, 19 - 23x on four (recall-size model: 97K tokens/s on 4 threads; 12.9M parameters: 347 us/token on one thread,
+10.2K tokens/s on four). The rows as 2-bit planes (masked integer and float add/subtract), the node states' rows as
+AVX-512 registers forward and backward, the trees and the branch gradient's chains through the other subtrees walked
+in lockstep with prefetch (36 independent walks a token at 4 trees of depth 9, their cache misses overlapping), the
+node rows' weight gradients summed in row order, the optimizer parallel over rows (at a batch of 2,048 tokens 89% of the node
 rows are touched: per token the update is sparse, per batch it is not). MQAR with --engine c on 4 threads: recall
 0.968 at 2,000 steps in 30 s (PyTorch: 0.983 in 645 s on 2).
 Hard routing turns float32 rounding into an occasional different branch (an activation within rounding of zero), as in
@@ -2008,6 +2010,8 @@ typedef struct {
     real *ds, *dR, *dp, *dx, *du, *gUr, *on, *Racc, *mx, *y;
     int *itapes;
     int8_t *xq8;
+    int *rcnt, *rord;
+    int *walk;  // the walks' current nodes: a tree's path, or a tree's chains through its other subtrees (T * (D + 1))  // the visits sorted by node row: (T * N + 1) offsets, (Lmax * T * (D + 1)) visit indices
     uint16_t *hp16;  // the fast path's tape of previous states in bfloat16 (n_layer, Lmax, T, D + 1, n * p)
     int tape_bf16;   // use it (tss_work_bf16): half the tape's bytes, the states' gradients from rounded values
     Tape *tp;
@@ -2043,12 +2047,12 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
         const real *B = pt, *C = pt + n, *V = pt + 2 * n, *Z = pt + 2 * n + pv;
         for (int tr = 0; tr < T; tr++) dtt[tr] = softplus(pt[2 * n + 2 * pv + tr] + dt_bias[tr]);
         memset(y, 0, sizeof(real) * d);
-        for (int tr = 0; tr < T; tr++) {
-            const size_t vb = ((size_t)t * T + tr) * (D + 1);
-            memset(Racc, 0, sizeof(real) * pv);
-            int a = 0;
-            for (int kk = 0; kk <= D; kk++) {  // the path: decay, read, branch, output, write
-                const size_t row = (size_t)tr * N + a, v = vb + kk;
+        memset(Racc, 0, sizeof(real) * T * pv);
+        int *node = w->walk;
+        for (int tr = 0; tr < T; tr++) node[tr] = 0;
+        for (int kk = 0; kk <= D; kk++)  // the trees in lockstep, level by level: their fetches overlap
+            for (int tr = 0; tr < T; tr++) {  // the path: decay, read, branch, output, write
+                const size_t row = (size_t)tr * N + node[tr], v = ((size_t)t * T + tr) * (D + 1) + kk;
                 real *ha = h + row * n * pv, *R = tp->R + v * pv;
                 const real dec = exp(-exp(A_log[row]) * dtt[tr]), wdt = dtt[tr];
 #if FAST
@@ -2087,23 +2091,37 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
                 }
                 const real s = qdotx(k, pin, Q->w_in, r_node + row, xt, xq, xs, d, g) + bias[row] + dotr(R, Z, pv);
                 qaxpy(k, pout, Q->w_out, r_node + row, y, gelu(s), d, g);
-                for (int q = 0; q < pv; q++) Racc[q] += R[q];
+                for (int q = 0; q < pv; q++) Racc[tr * pv + q] += R[q];
                 tp->node[v] = (int)row, tp->s[v] = s, tp->decay[v] = dec;
-                a = 2 * a + 1 + (s > 0);
+                node[tr] = 2 * node[tr] + 1 + (s > 0);
+                if (kk < D) {  // the chosen child's state and row, while the other trees take their turn
+                    const size_t nr = (size_t)tr * N + node[tr];
+                    const char *hs = (const char *)(h + nr * n * pv);
+                    for (int o = 0; o < n * pv * (int)sizeof(real); o += 64) __builtin_prefetch(hs + o);
+#if FAST
+                    if (k && k->ok) __builtin_prefetch(pin->bits + (r_node + nr) * (d / 32));
+#endif
+                }
             }
-            for (int q = 0; q < pv; q++) qaxpy(k, pU, Q->U, r_U + (size_t)tr * pv + q, y, Racc[q], d, g);
-        }
-        // the other subtrees (read-only: their states as they stand at t, the token's own arrival decay)
-        for (int tr = 0; tr < T; tr++) {
-            const size_t vb = ((size_t)t * T + tr) * (D + 1), ab = ((size_t)t * T + tr) * AL;
-            int ai = 0;
+        for (int tr = 0; tr < T; tr++)
+            for (int q = 0; q < pv; q++) qaxpy(k, pU, Q->U, r_U + (size_t)tr * pv + q, y, Racc[tr * pv + q], d, g);
+        // the other subtrees (read-only: their states as they stand at t, the token's own arrival decay): the chain from
+        // branch kk enters the other child at level kk + 1 and follows its own decisions down; a tree's D chains and the
+        // trees' are independent, so they advance level by level together and their fetches overlap. Each chain's
+        // nodes are stored at base(kk) + (level - kk - 1), base(kk) = sum over m < kk of (D - m).
+        int *cn = w->walk;
+        for (int tr = 0; tr < T; tr++)
             for (int kk = 0; kk < D; kk++) {
-                const int ak = tp->node[vb + kk] - tr * N;
-                int cn = 2 * ak + 2 - (tp->s[vb + kk] > 0);
-                for (int j = kk + 1; j <= D; j++, ai++) {
-                    const size_t row = (size_t)tr * N + cn;
+                const size_t v = ((size_t)t * T + tr) * (D + 1) + kk;
+                cn[tr * (D + 1) + kk] = 2 * (tp->node[v] - tr * N) + 2 - (tp->s[v] > 0);
+            }
+        for (int j = 1; j <= D; j++)
+            for (int tr = 0; tr < T; tr++) {
+                const size_t ab = ((size_t)t * T + tr) * AL;
+                for (int kk = 0, base = 0; kk < j; base += D - kk, kk++) {
+                    const size_t ai = ab + base + (j - kk - 1), row = (size_t)tr * N + cn[tr * (D + 1) + kk];
                     const real dec = exp(-exp(A_log[row]) * dtt[tr]), *hr = h + row * n * pv;
-                    real *R = tp->aR + (ab + ai) * pv;
+                    real *R = tp->aR + ai * pv;
 #if FAST
                     if (vec) {
                         __m512 vR = _mm512_setzero_ps();
@@ -2117,11 +2135,19 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
                             for (int q = 0; q < pv; q++) R[q] += C[jj] * dec * hr[jj * pv + q];
                     }
                     const real s = qdotx(k, pin, Q->w_in, r_node + row, xt, xq, xs, d, g) + bias[row] + dotr(R, Z, pv);
-                    tp->anode[ab + ai] = (int)row, tp->as[ab + ai] = s;
-                    cn = 2 * cn + 1 + (s > 0);
+                    tp->anode[ai] = (int)row, tp->as[ai] = s;
+                    const int nx = 2 * cn[tr * (D + 1) + kk] + 1 + (s > 0);
+                    cn[tr * (D + 1) + kk] = nx;
+                    if (j < D) {  // the next node's state and row, while the other chains run
+                        const size_t nr = (size_t)tr * N + nx;
+                        const char *hs = (const char *)(h + nr * n * pv);
+                        for (int o = 0; o < n * pv * (int)sizeof(real); o += 64) __builtin_prefetch(hs + o);
+#if FAST
+                        if (k && k->ok) __builtin_prefetch(pin->bits + (r_node + nr) * (d / 32));
+#endif
+                    }
                 }
             }
-        }
         for (int i = 0; i < d; i++) xres[(size_t)t * d + i] += y[i];
     }
 }
@@ -2167,7 +2193,6 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
                 const size_t v = vb + kk, row = tp->node[v];
                 const real s = tp->s[v], go = qdotf(k, pout, Q->w_out, r_node + row, gy, d, gs);
                 on[kk] = gelu(s) * go + dotr(gUr, tp->R + v * pv, pv);
-                axpy(gw_out + row * d, gelu(s), gy, d);
                 ds[v] += dgelu(s) * go;
                 for (int q = 0; q < pv; q++) dR[v * pv + q] += gUr[q];
                 hit[row] = 1;
@@ -2190,9 +2215,28 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
                     dZ[q] += dsv * tp->R[v * pv + q];
                     dR[v * pv + q] += dsv * Z[q];
                 }
-                axpy(gw_in + row * d, dsv, xt, d);
                 qaxpy(k, pin, Q->w_in, r_node + row, dxt, dsv, d, gs);
                 gbias[row] += dsv;
+            }
+        }
+    }
+    // A': the node rows' weight gradients in row order: the visits counting-sorted by row, then each row's sum
+    // dw_out += gelu(s) g_t, dw_in += ds x_t over its visits in one run (the row stays in cache; the tokens' g and x
+    // are the layer's (L, d) arrays). The same sums as per visit, in another order.
+    {
+        const int TN = T * N, VD = T * (D + 1);
+        int *cnt = w->rcnt, *ord = w->rord;
+        memset(cnt, 0, sizeof(int) * (TN + 1));
+        for (size_t v = 0; v < V; v++) cnt[tp->node[v] + 1]++;
+        for (int r = 0; r < TN; r++) cnt[r + 1] += cnt[r];
+        for (size_t v = 0; v < V; v++) ord[cnt[tp->node[v]]++] = (int)v;  // cnt[r] is now the end of row r
+        for (int r = 0, start = 0; r < TN; start = cnt[r], r++) {
+            if (start == cnt[r]) continue;
+            real *go = gw_out + (size_t)r * d, *gi = gw_in + (size_t)r * d;
+            for (int e = start; e < cnt[r]; e++) {
+                const int v = ord[e], t = v / VD;
+                axpy(go, gelu(tp->s[v]), g + (size_t)t * d, d);
+                axpy(gi, ds[v], tp->x + (size_t)t * d, d);
             }
         }
     }
@@ -2289,9 +2333,12 @@ Work *tss_work_new(const Cfg *c, int Lmax) {
     w->ds = calloc(V, sizeof(real)), w->dR = calloc(V * c->p, sizeof(real));
     w->dp = calloc((size_t)Lmax * PDIM(c), sizeof(real));
     w->dx = calloc((size_t)Lmax * d, sizeof(real)), w->du = calloc((size_t)Lmax * d, sizeof(real));
-    w->gUr = calloc(c->p, sizeof(real)), w->on = calloc(c->D + 1, sizeof(real)), w->Racc = calloc(c->p, sizeof(real));
+    w->gUr = calloc(c->p, sizeof(real)), w->on = calloc(c->D + 1, sizeof(real)), w->Racc = calloc((size_t)T * c->p, sizeof(real));
+    w->walk = calloc((size_t)T * (c->D + 1), sizeof(int));
     w->mx = calloc(d, sizeof(real)), w->y = calloc(d, sizeof(real));
     w->xq8 = calloc((size_t)nl * Lmax * d, 1);
+    w->rcnt = calloc((size_t)T * N + 1, sizeof(int));
+    w->rord = calloc((size_t)Lmax * T * (c->D + 1), sizeof(int));
     w->hp16 = calloc((size_t)nl * Lmax * T * (c->D + 1) * c->n * c->p, sizeof(uint16_t));
     for (int l = 0; l < nl; l++) {
         tape_carve(c, Lmax, w->tapes + tr * l, w->itapes + ti * l, w->tp + l);
@@ -2303,7 +2350,7 @@ Work *tss_work_new(const Cfg *c, int Lmax) {
 void tss_work_free(Work *w) {
     free(w->tapes), free(w->itapes), free(w->tp), free(w->x), free(w->g), free(w->h), free(w->lam), free(w->xn);
     free(w->dxn), free(w->lg), free(w->ds), free(w->dR), free(w->dp), free(w->dx), free(w->du), free(w->gUr);
-    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w->xq8), free(w->hp16), free(w);
+    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w->xq8), free(w->hp16), free(w->rcnt), free(w->rord), free(w->walk), free(w);
 }
 
 void tss_work_bf16(Work *w, int on) { w->tape_bf16 = on; }
