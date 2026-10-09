@@ -136,6 +136,7 @@ class TreeSSM(nn.Module):
         self.w_in = nn.Parameter(torch.empty(T, N, d).uniform_(-k_in, k_in))
         self.bias = nn.Parameter(torch.empty(T, N).uniform_(-k_in, k_in))
         self.w_out = nn.Parameter(torch.empty(T, N, d).uniform_(-k_out, k_out))
+        self.record, self.stats = False, None
         self.conv = nn.Parameter(torch.zeros(cfg.d_conv, d))  # tap j looks j tokens back; the identity at init
         with torch.no_grad():
             self.conv[0] = 1.0
@@ -184,6 +185,8 @@ class TreeSSM(nn.Module):
         w_in, w_out, proj, U = self.weights()
         tree = torch.arange(T, device=u.device)
         mem = None
+        if self.record:
+            self.stats = [x.detach()]  # the trees' input, then per level: nodes, gelu(s), reads
         if cfg.memory:
             B, C, V, Z, dt = self.signals(x, proj)
             strict = torch.ones(L, L, dtype=torch.bool, device=u.device).tril(-1)[None, :, :, None]  # s < t
@@ -194,7 +197,7 @@ class TreeSSM(nn.Module):
             visitors: (nodes, inclusive clocks) of the tokens that did visit level k, if not these."""
             s = torch.einsum("bld,bltd->blt", x, w_in[tree, node]) + self.bias[tree, node]
             out = F.gelu(s)[..., None] * w_out[tree, node]
-            clock = None
+            clock = R = None
             if mem is not None:
                 CB, V, Z, dt, strict = mem
                 vnode, vclock = visitors if visitors else (node, None)
@@ -206,17 +209,21 @@ class TreeSSM(nn.Module):
                 R = torch.einsum("btsh,bsp->bthp", M, V)  # what each token reads there, (b, l, trees, value)
                 s = s + (R * Z[:, :, None]).sum(-1)
                 out = F.gelu(s)[..., None] * w_out[tree, node] + torch.einsum("blhp,hpd->blhd", R, self.U_at(U, k))
-            return s, out, clock
+            return s, out, clock, R
 
         node = torch.zeros(b, L, T, dtype=torch.long, device=u.device)
         path = []  # per level: node, s, output, inclusive clock
         for k in range(D + 1):
-            s, out, clock = visit(node, k)
+            s, out, clock, R = visit(node, k)
             path.append((node, s, out, clock))
+            if self.record:  # for an optimizer that needs per-node statistics (deepboost.py)
+                if s.requires_grad:
+                    s.retain_grad()  # the split's pseudo-residual, dL/ds, per token
+                self.stats.append((node, F.gelu(s).detach(), None if R is None else R.detach(), s))
             node = 2 * node + 1 + (s > 0).long()
         y = sum(out for _, _, out, _ in path).sum(2)
         if not torch.is_grad_enabled() or D == 0:
-            return y
+            return self._out(y)
         with torch.no_grad():  # the branch gradient's two sides: on (taken, below the branch) and alt (the other child down)
             outs = torch.stack([out for _, _, out, _ in path])
             on = outs.flip(0).cumsum(0).flip(0)  # on[k] = sum of levels >= k
@@ -225,7 +232,7 @@ class TreeSSM(nn.Module):
                 a, s_k = path[k][0], path[k][1]
                 alt_node, alt = 2 * a + 2 - (s_k > 0).long(), 0  # the other child
                 for j in range(k + 1, D + 1):
-                    s_alt, out_alt, _ = visit(alt_node, j, (path[j][0], path[j][3]))
+                    s_alt, out_alt = visit(alt_node, j, (path[j][0], path[j][3]))[:2]
                     alt = alt + out_alt
                     alt_node = 2 * alt_node + 1 + (s_alt > 0).long()
                 diff.append(on[k + 1] - alt)
@@ -233,6 +240,12 @@ class TreeSSM(nn.Module):
             s_k = path[k][1]
             g = torch.sigmoid(torch.where(s_k > 0, s_k, -s_k) / cfg.temp)
             y = y + torch.einsum("blt,bltd->bld", g - g.detach(), diff[k])  # zero going forward
+        return self._out(y)
+
+    def _out(self, y):
+        if self.record and y.requires_grad:
+            y.retain_grad()  # the value's pseudo-residual, dL/dy, per token
+            self.out = y
         return y
 
     def reference(self, u):
