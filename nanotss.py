@@ -60,7 +60,8 @@ Three forms of one function
   q = min(1, m sigma' / sum sigma') over its tree's branches and its term reweighted by 1 / q; the mean converges to
   the exact gradient, selftest --c). Tiny Shakespeare, 5,000 steps, one seed: exact 1.594 in 12.3 min (27.8K
   tokens/s), 2 walks of 7 1.602 in 9.7 min (35.3K), 1 walk 1.605 in 8.5 min (40.0K); step for step within ~0.01 of
-  exact, and ahead at equal wall time (~8.6 min: exact ~1.62, 2 walks ~1.59, 1 walk 1.61). Default: exact.
+  exact, and ahead at equal wall time (~8.6 min: exact ~1.62, 2 walks ~1.59, 1 walk 1.61). Default: 2 walks (the C
+  trainer, lm, mqar --engine c; --walks 0 for the exact gradient).
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
@@ -869,7 +870,7 @@ def mqar(a):
                  state=a.state, value=a.value, memory=a.memory, readout=a.readout, ternary=a.quant,
                  act_bits=8 if a.quant else 0)
     model = TSS(cfg)
-    trainer = CTrainer(model, threads=a.threads, lr=a.lr) if a.engine == "c" else None
+    trainer = CTrainer(model, threads=a.threads, lr=a.lr, walks=a.walks) if a.engine == "c" else None
     print(f"tss mqar ({a.engine}): {sum(p.numel() for p in model.parameters()) / 1e3:.0f}K parameters, memory={a.memory}, "
           f"depth {a.depth}, readout {a.readout}, {'ternary' if a.quant else 'float'}, {a.kv} pairs of {a.keys} keys, length {3 * a.kv}", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.98), weight_decay=0.01)
@@ -2610,7 +2611,7 @@ class CTrainer:
     NAMES = ["embed", "norm_f", "norm", "conv", "w_in", "bias", "w_out", "A_log", "proj", "dt_bias", "U"]
 
     def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False, fast=True,
-                 tape_bf16=True, walks=0):
+                 tape_bf16=True, walks=2):
         import ctypes
 
         import numpy as np
@@ -2719,7 +2720,7 @@ def selftest_c():
     loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten(), reduction="sum")
     loss.backward()
     want = {k: torch.cat([t.grad.flatten() for t in ts]).numpy() for k, ts in _c_tensors(model).items()}
-    tr = CTrainer(model, Lmax=64, double=True)
+    tr = CTrainer(model, Lmax=64, double=True, walks=0)  # every walk: the exact gradient
     closs = sum(tr.grad(ids[b].numpy(), labels[b].numpy()) for b in range(2))
     assert abs(closs - loss.item()) < 1e-9 * abs(loss.item()), f"C loss {closs} != {loss.item()}"
     worst = max((np.abs(want[k] - tr.grads[k]).max() / (np.abs(want[k]).max() + 1e-30), k) for k in want)
@@ -2836,6 +2837,7 @@ def main():
     m.add_argument("--readout", default="tree", choices=["level", "tree", "layer"])
     m.add_argument("--float", dest="quant", action="store_false", help="float weights and activations (the ablation)")
     m.add_argument("--engine", default="torch", choices=["torch", "c"], help="c: the sparse C training step (CPU)")
+    m.add_argument("--walks", type=int, default=2, help="with --engine c: the branch gradient's sampled walks (0: all)")
     m.add_argument("--steps", type=int, default=2000)
     m.add_argument("--batch", type=int, default=64)
     m.add_argument("--lr", type=float, default=3e-3)
@@ -2849,7 +2851,7 @@ def main():
     lmp.add_argument("--layers", type=int, default=4)
     lmp.add_argument("--trees", type=int, default=4)
     lmp.add_argument("--depth", type=int, default=7)
-    lmp.add_argument("--walks", type=int, default=0,
+    lmp.add_argument("--walks", type=int, default=2,
                      help="the branch gradient's walks per tree and token, sampled and reweighted (0: all, exact)")
     lmp.add_argument("--state", type=int, default=16)
     lmp.add_argument("--value", type=int, default=16)
