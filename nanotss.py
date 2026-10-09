@@ -57,9 +57,7 @@ Three forms of one function
   of the subtree the token took and of the other one; in the definition, a node's path weight carries the gradient of
   the branches at most r levels above it. The training form, ``reference`` and the C step agree on it (selftest,
   selftest --c). The other subtrees' walks are most of what training costs beyond inference; capping them is the
-  largest lever left (Shakespeare model on 4 threads: 29.4K tokens/s full, 37.2K at r = 2, 40.8K at r = 1). It does
-  not pay: on Tiny Shakespeare (5,000 steps, one seed) held-out 1.594 full in 12.3 min, 1.633 at r = 2 in 10.0 min,
-  1.653 at r = 1 in 9.1 min, and at equal wall time the full gradient is ahead too (~1.62 at 9 min). Default: full.
+  largest lever left (Shakespeare model on 4 threads: 29.4K tokens/s full, 37.2K at r = 2, 40.8K at r = 1).
 
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
