@@ -37,16 +37,18 @@ Two forms of one function:
   linear in length; the branch gradient's other side enters the same scan as read-only entries (no write, no decay
   passed on). This is the shape a GPU wants: after the sort, the threads of a chunk work on one node's tokens, one
   weight row and one decay rate (no divergence), over contiguous memory (coalesced); a level is a sort, gathers and
-  batched small matrix products, as a mixture-of-experts dispatch. Training cost per token is flat in length
-  (2 layers, d 64, 4 trees of depth 5, 4 CPU threads: ~240 us/token from 64 to 4,096 tokens, against a quadratic
-  form's 1.5 s a step at 1,024).
+  batched small matrix products, as a mixture-of-experts dispatch. The kernels are in tss_kernels.py (Triton,
+  with PyTorch fallbacks; ``selftest --kernels`` checks one against the other through the whole model). Training cost
+  per token is flat in length (2 layers, d 64, 4 trees of depth 5, 4 CPU threads, PyTorch path: 260 - 370 us/token
+  from 64 to 4,096 tokens, against a quadratic form's 1.5 s a step at 1,024; the sorted layout costs the CPU path
+  ~1.5x over unsorted gathers, the price of the GPU's layout).
 ``selftest`` checks, in float64, that the training form equals the recurrence (routes included) and that its
 gradients equal those of ``reference``, the path-weight definition over every node.
 
 Inference in C (tss_step.c): the same recurrence on the ternary codes and int8 activations, one token at a time,
 touching only the visited rows and states.
 
-    python tss.py selftest
+    python tss.py selftest [--kernels]    # --kernels: the Triton kernels vs PyTorch (TRITON_INTERPRET=1 without a GPU)
     python tss.py mqar [--float] [--no-memory] [--depth 0] [--readout level|tree|layer]   # associative recall, CPU
     python tss.py bench                   # the C step against the PyTorch recurrence, then tokens/s on one core
 
@@ -77,6 +79,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from tss_kernels import group_dot, group_outer, segscan
 
 
 @dataclass
@@ -183,59 +187,62 @@ class TreeSSM(nn.Module):
         return B, C, V, Z, F.softplus(dt + self.dt_bias)
 
     def forward(self, u):
-        """The training form, u: (b, l, d). Levels in turn; within a level, every node's state over time is one
-        segmented scan (``segscan``) over the level's tokens sorted by node: linear in length. Going backward each
+        """The training form, u: (b, l, d). Levels in turn; each level is one pass over its tokens sorted by node
+        (tree, node, sequence, time): grouped products with the node's weight rows (``group_dot``, ``group_outer``),
+        and every node's state over time as one segmented scan (``segscan``), linear in length. Going backward each
         branch learns from GTS's straight-through gradient: sign * (on - alt) * sigmoid'(s / temp) / temp, where on is
         what the subtree the token took output below the branch and alt what the other subtree would have, following
         the token's own decisions and reading the states it would have found there (``reference`` is the definition).
-        Those reads are the same scan's read-only entries."""
+        Those are read-only entries of the same pass."""
         cfg = self.cfg
         b, L, _ = u.shape
-        T, D = cfg.trees, cfg.depth
+        T, D, N = cfg.trees, cfg.depth, self.w_in.shape[1]
+        dev = u.device
         x = self.mix(u)
         w_in, w_out, proj, U = self.weights()
-        tree = torch.arange(T, device=u.device)
+        w_in, w_out, bias = w_in.reshape(T * N, -1), w_out.reshape(T * N, -1), self.bias.reshape(-1)
         if cfg.memory:
             B, C, V, Z, dt = self.signals(x, proj)
+            A = torch.exp(self.A_log.reshape(-1))
+        M = b * L * T
+        bi = torch.arange(b, device=dev).view(b, 1, 1).expand(b, L, T).reshape(-1)
+        li = torch.arange(L, device=dev).view(1, L, 1).expand(b, L, T).reshape(-1)
+        ti = torch.arange(T, device=dev).view(1, 1, T).expand(b, L, T).reshape(-1)
 
-        def reads(node, queries=()):
-            """What each token at node (b, l, trees) of a level reads there (its visitors before it, then its own
-            write), and for each node tensor in queries, what that token would read there (no write)."""
-            if not cfg.memory:
-                return None, [None] * len(queries)
-            M, n_nodes = b * L * T, self.w_in.shape[1]
-            bi = torch.arange(b, device=u.device).view(b, 1, 1).expand(b, L, T).reshape(-1)
-            li = torch.arange(L, device=u.device).view(1, L, 1).expand(b, L, T).reshape(-1)
-            ti = tree.view(1, 1, T).expand(b, L, T).reshape(-1)
+        def level(k, node, queries=()):
+            """The tokens at node (b, l, trees) of level k read their node's state, then write it; the tokens at each
+            node tensor in queries only read there. Returns, per tensor, the activation s (b, l, trees) and the node
+            output (b, l, trees, d)."""
+            nq = len(queries) + 1
             nodes = torch.cat([node.reshape(-1)] + [q.reshape(-1) for q in queries])
-            k = len(queries) + 1
-            bi, li, ti = bi.repeat(k), li.repeat(k), ti.repeat(k)
-            member = torch.arange(k * M, device=u.device) < M
-            seg = (bi * T + ti) * n_nodes + nodes  # a segment: one node of one tree of one sequence
-            order = torch.argsort(seg * L + li)  # contiguous segments, in time within each
-            dt_e = dt[bi, li, ti]
-            log_decay = -torch.exp(self.A_log[ti, nodes]) * dt_e
-            zero = torch.zeros((), dtype=dt.dtype, device=u.device)
-            a_e = torch.where(member, log_decay, zero)  # a query decays nothing that comes after it
-            X_e = torch.where(member[:, None], dt_e[:, None] * V[bi, li], zero)
-            Y = segscan(C[bi, li][order], B[bi, li][order], X_e[order], a_e[order], seg[order])
-            Y = torch.zeros_like(Y).index_copy(0, order, Y)
-            Y = torch.where(member[:, None], Y, Y * torch.exp(log_decay)[:, None])  # a query's own arrival decay
-            R = Y[:M].view(b, L, T, -1)
-            return R, [Y[M * (i + 1) : M * (i + 2)].view(b, L, T, -1) for i in range(len(queries))]
+            grp = ti.repeat(nq) * N + nodes  # the node's weight row
+            BI, LI = bi.repeat(nq), li.repeat(nq)
+            order = torch.argsort((grp * b + BI) * L + LI)  # by node, then sequence, then time
+            g, BI, LI = grp[order], BI[order], LI[order]
+            s = group_dot(x[BI, LI], w_in, g) + bias[g]
+            out = 0
+            if cfg.memory:
+                member = order < M
+                dt_e = dt.reshape(b * L, T)[BI * L + LI, g // N]
+                log_decay = -A[g] * dt_e
+                zero = torch.zeros((), dtype=dt.dtype, device=dev)
+                R = segscan(C[BI, LI], B[BI, LI], torch.where(member[:, None], dt_e[:, None] * V[BI, LI], zero),
+                            torch.where(member, log_decay, zero), g * b + BI)  # a segment: a node of one sequence
+                R = torch.where(member[:, None], R, R * torch.exp(log_decay)[:, None])  # a query's own arrival decay
+                s = s + (R * Z[BI, LI]).sum(-1)
+                Uk = self.U_at(U, k)  # entries are tree-major: one matrix product per tree
+                counts = torch.bincount(g // N, minlength=T).tolist()
+                out = torch.cat([Rt @ Uk[t] for t, Rt in enumerate(torch.split(R, counts))])
+            out = out + group_outer(F.gelu(s), w_out, g)
+            inv = torch.empty_like(order)
+            inv[order] = torch.arange(len(order), device=dev)
+            s, out = s[inv], out[inv]  # back to token order
+            return [(s[i * M : (i + 1) * M].view(b, L, T), out[i * M : (i + 1) * M].view(b, L, T, -1)) for i in range(nq)]
 
-        def visit(node, k, R):
-            """Each token at node (b, l, trees) of level k, having read R there: its activation s and output."""
-            s = torch.einsum("bld,bltd->blt", x, w_in[tree, node]) + self.bias[tree, node]
-            if R is None:
-                return s, F.gelu(s)[..., None] * w_out[tree, node]
-            s = s + (R * Z[:, :, None]).sum(-1)
-            return s, F.gelu(s)[..., None] * w_out[tree, node] + torch.einsum("blhp,hpd->blhd", R, self.U_at(U, k))
-
-        node = torch.zeros(b, L, T, dtype=torch.long, device=u.device)
+        node = torch.zeros(b, L, T, dtype=torch.long, device=dev)
         path = []  # per level: node, s, output
         for k in range(D + 1):
-            s, out = visit(node, k, reads(node)[0])
+            s, out = level(k, node)[0]
             path.append((node, s, out))
             node = 2 * node + 1 + (s > 0).long()
         y = sum(out for _, _, out in path).sum(2)
@@ -247,9 +254,7 @@ class TreeSSM(nn.Module):
             for j in range(1, D + 1):
                 a, s_prev = path[j - 1][0], path[j - 1][1]
                 chains.append([2 * a + 2 - (s_prev > 0).long(), 0])  # the other child of level j - 1's branch
-                _, alt_reads = reads(path[j][0], [c[0] for c in chains])  # the level's visitors, the chains as queries
-                for c, R in zip(chains, alt_reads):
-                    s_alt, out_alt = visit(c[0], j, R)
+                for c, (s_alt, out_alt) in zip(chains, level(j, path[j][0], [c[0] for c in chains])[1:]):
                     c[1] = c[1] + out_alt
                     c[0] = 2 * c[0] + 1 + (s_alt > 0).long()
         for k in range(D):
@@ -333,47 +338,6 @@ class TreeSSM(nn.Module):
         return y
 
 
-def segscan(C, B, X, a, seg, chunk=64):
-    """Y_i = sum over j < i with seg_j = seg_i of exp(a_{j+1} + ... + a_i) <C_i, B_j> X_j, over one stream sorted so
-    that each segment is contiguous: C, B (M, state); X (M, value); a (M,) log-decays <= 0; seg (M,) ids. Linear in M:
-    chunks of ``chunk`` entries, each read within its chunk as a masked quadratic form plus the state carried in from
-    the chunks before (Mamba-2's chunked scan, with the segments' resets as masks rather than as log-decays of -inf,
-    which would cost float32 its precision). On a GPU each chunk is one program: the same node's tokens in a row
-    (one weight row, one decay rate, no divergence) and contiguous loads."""
-    M, Q = X.shape[0], chunk
-    pad = -M % Q
-    if pad:
-        z = lambda t: torch.cat([t, t.new_zeros((pad,) + t.shape[1:])])  # noqa: E731
-        C, B, X, a = z(C), z(B), z(X), z(a)
-        seg = torch.cat([seg, -1 - torch.arange(pad, device=seg.device)])  # padding: segments of its own
-    nc = (M + pad) // Q
-    C, B, X, a, seg = C.view(nc, Q, -1), B.view(nc, Q, -1), X.view(nc, Q, -1), a.view(nc, Q), seg.view(nc, Q)
-    cs = a.cumsum(1)  # inclusive, within the chunk
-    strict = torch.ones(Q, Q, dtype=torch.bool, device=a.device).tril(-1)
-    same = (seg[:, :, None] == seg[:, None, :]) & strict
-    W = torch.exp((cs[:, :, None] - cs[:, None, :]).masked_fill(~same, -torch.inf)) * (C @ B.transpose(1, 2))
-    Y = W @ X
-    # the state each chunk hands on: that of the segment open at its end
-    last = seg[:, -1]
-    S = torch.einsum("cj,cjn,cjp->cnp", torch.exp(cs[:, -1:] - cs) * (seg == last[:, None]), B, X)
-    # H[c] = sum over c' < c with last[c'] = last[c - 1] of exp(the decays of chunks c' + 1 .. c - 1) S[c']: the state
-    # entering chunk c. Segment ids ascend along the stream, so this is the same scan one level up, over the chunks
-    # (C = B = 1, the states as values): G[c] = scan + S[c] inclusive, H[c] = G[c - 1]. Few chunks: one masked matrix.
-    A = cs[:, -1]
-    if nc > Q:
-        Sf = S.reshape(nc, -1)
-        one = Sf.new_ones(nc, 1)
-        G = segscan(one, one, Sf, A, last, chunk) + Sf
-    else:
-        same_c = (last[:, None] == last[None, :]) & torch.ones(nc, nc, dtype=torch.bool, device=a.device).tril()
-        Gc = A.cumsum(0)
-        G = (torch.exp((Gc[:, None] - Gc[None, :]).masked_fill(~same_c, -torch.inf)) @ S.reshape(nc, -1))
-    H = torch.cat([G.new_zeros(1, G.shape[1]), G[:-1]]).view_as(S)
-    reader = seg == torch.cat([last.new_full((1,), -2), last[:-1]])[:, None]  # in the segment that was carried in
-    Y = Y + (reader * torch.exp(cs))[..., None] * (C @ H)
-    return Y.reshape(nc * Q, -1)[:M]
-
-
 class TSS(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -451,6 +415,39 @@ def selftest():
         assert all(torch.allclose(x, y, atol=1e-10) for x, y in zip(gw, gg)), f"segscan, chunk {q}: gradients"
     print("selftest passed: training form == recurrence (routes included) and its gradients == the path-weight definition "
           "(ternary and float; stateful and stateless; every readout); the segmented scan == its loop")
+
+
+def selftest_kernels():
+    """The Triton kernels against the PyTorch paths, through the whole model: logits and every parameter's gradient,
+    float32. Without a GPU: TRITON_INTERPRET=1 python tss.py selftest --kernels (slow)."""
+    import os
+
+    import tss_kernels
+
+    assert tss_kernels.triton is not None, "needs triton"
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    assert dev == "cuda" or os.environ.get("TRITON_INTERPRET") == "1", "no GPU: set TRITON_INTERPRET=1"
+    torch.manual_seed(0)
+    for readout in ("tree", "level"):
+        cfg = Config(vocab_size=64, d_model=64, n_layer=2, trees=3, depth=3, state=8, value=8, readout=readout, ternary_group=32)
+        model = TSS(cfg).to(dev)
+        for layer in model.layers:
+            layer.w_in.data *= 4
+        ids = torch.randint(0, 64, (2, 90), device=dev)  # 2 x 90 x 3 = 540 entries a level: several chunks of the scan
+        results = []
+        for k in (False, True):
+            tss_kernels.USE_TRITON = k
+            model.zero_grad()
+            logits = model(ids)
+            F.cross_entropy(logits.flatten(0, 1), ids.flatten()).backward()
+            results.append((logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}))
+        tss_kernels.USE_TRITON = True
+        (l0, g0), (l1, g1) = results
+        rel = lambda x, y: ((x - y).norm() / (y.norm() + 1e-30)).item()  # noqa: E731
+        worst = max((rel(g1[n], g0[n]), n) for n in g0)
+        print(f"readout {readout}: kernels vs PyTorch: logits {rel(l1, l0):.1e}, worst gradient {worst[0]:.1e} ({worst[1]})")
+        assert rel(l1, l0) < 1e-4 and worst[0] < 1e-3, "the Triton kernels disagree with the PyTorch paths"
+    print("selftest --kernels passed")
 
 
 # -------------------------------------------------------------------------------------------------------------- mqar
@@ -687,7 +684,8 @@ def bench(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("selftest")
+    st = sub.add_parser("selftest")
+    st.add_argument("--kernels", action="store_true", help="the Triton kernels against the PyTorch paths")
     m = sub.add_parser("mqar")
     m.add_argument("--no-memory", dest="memory", action="store_false")
     m.add_argument("--kv", type=int, default=8)
@@ -717,7 +715,7 @@ def main():
     bn.add_argument("--readout", default="tree", choices=["level", "tree", "layer"])
     bn.add_argument("--tokens", type=int, default=20000)
     a = p.parse_args()
-    {"selftest": lambda a: selftest(), "mqar": mqar, "bench": bench}[a.cmd](a)
+    {"selftest": lambda a: selftest_kernels() if a.kernels else selftest(), "mqar": mqar, "bench": bench}[a.cmd](a)
 
 
 if __name__ == "__main__":
