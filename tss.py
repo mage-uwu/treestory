@@ -53,14 +53,18 @@ sequences on 2 CPU threads; recall accuracy at steps 600 / 800 / 2,000):
     depth 5, ternary + 8-bit + the branch gradient          0.50 / 0.80 / 0.983
 Nodes holding a decayed sum of values (no <C, B> matching within a node) reached only 0.20: the route alone could not
 address the right value. The readout of the reads per level, per tree or per layer made no difference to recall.
-Speed (bench: d 256, 6 layers, 4 trees of depth 9, 12.9M parameters, vocab 256; one core of a 2.1 GHz Xeon, batch 1):
-    float 127 us/token, ternary 115 (readout per tree). Time grows with the nodes visited (depth + 1 per tree), not
-    with the nodes stored; here everything fits in the 260 MB L3, so the naive loops are the cost, not memory. The C
-    codes are one int8 a weight for now (2-bit packing, SIMD and interleaving the trees' dependent fetches are next).
+Speed (bench: d 256, 6 layers, 4 trees of depth 9, 12.9M parameters, vocab 256; a 2.1 GHz Xeon, AVX-512, batch 1):
+    plain C 120 us/token; AVX2 (int8 codes, sign-and-add) 78; 2-bit (two bitmasks a row, masked add/sub) 56.
+    Several sequences across cores, 2-bit: 64K tokens/s for 4 sequences on 4 cores; 64 sequences on 4 cores 48K tokens/s
+    with bfloat16 node states, 11K with float32 (25 MB of state a sequence no longer fits in cache).
+The node state, not the weights, is what a stateful tree has to move: 1 KB a visit in float32 against 128 bytes of
+weights. Every kernel agrees with the others to float32 rounding; against PyTorch, now and then a branch whose
+activation is within rounding of zero turns the other way (summation order), as in GTS.
 """
 
 import argparse
 import math
+import os
 import time
 from dataclasses import dataclass
 
@@ -422,7 +426,7 @@ def mqar(a):
 # --------------------------------------------------------------------------------------------------- C inference
 
 
-def c_step(model):
+def c_step(model, state_bf16=False):
     """tss_step.c built and loaded, with the model packed for it: ternary weights as int8 codes and one scale per
     group, as the forward pass uses them. Returns step(token, state, logits), with .run and .new_state."""
     import ctypes
@@ -436,7 +440,7 @@ def c_step(model):
     here = os.path.dirname(os.path.abspath(__file__))
     so, src = os.path.join(here, "tss_step.so"), os.path.join(here, "tss_step.c")
     if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(src):
-        subprocess.check_call(["cc", "-O3", "-march=native", "-ffast-math", "-shared", "-fPIC", "-o", so, src, "-lm"])
+        subprocess.check_call(["cc", "-O3", "-march=native", "-ffast-math", "-fopenmp", "-shared", "-fPIC", "-o", so, src, "-lm"])
     lib = ctypes.CDLL(so)
     f, i8 = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int8)
     g = group_size(cfg.d_model, cfg.ternary_group)
@@ -444,11 +448,15 @@ def c_step(model):
     class Ternary(ctypes.Structure):
         _fields_ = [("codes", i8), ("scales", f)]
 
+    class Packed(ctypes.Structure):
+        _fields_ = [("bits", ctypes.POINTER(ctypes.c_uint64)), ("scales", f)]
+
     class Model(ctypes.Structure):
         _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "trees", "depth", "state", "value", "d_conv",
                                                 "memory", "readout", "group")] + [
             ("embed", f), ("norm_f", f), ("norm", f), ("conv", f), ("w_in", Ternary), ("bias", f), ("w_out", Ternary),
-            ("proj", Ternary), ("dt_bias", f), ("neg_A", f), ("U", Ternary)]
+            ("proj", Ternary), ("dt_bias", f), ("neg_A", f), ("U", Ternary),
+            ("w_in2", Packed), ("w_out2", Packed), ("proj2", Packed), ("U2", Packed), ("state_bf16", ctypes.c_int)]
 
     keep = []
 
@@ -457,7 +465,9 @@ def c_step(model):
         keep.append(a)
         return a.ctypes.data_as(f)
 
-    def tern(fn):  # the codes and scales ``ternary`` computes, over every layer
+    packed = {}
+
+    def tern(fn):  # the codes and scales ``ternary`` computes, over every layer; also kept as 2-bit planes
         codes, scales = [], []
         for l in model.layers:
             w = fn(l).detach().double().reshape(-1, cfg.d_model)
@@ -467,6 +477,14 @@ def c_step(model):
             scales.append(sc.float().flatten())
         c, sc = np.ascontiguousarray(torch.cat(codes).numpy()), np.ascontiguousarray(torch.cat(scales).numpy())
         keep.extend([c, sc])
+        if cfg.d_model % 64 == 0:  # per row, per 64 weights: a plus and a minus bitmask, bit i = weight i
+            chunks = c.reshape(-1, cfg.d_model // 64, 64)
+            weights = (np.uint64(1) << np.arange(64, dtype=np.uint64))
+            planes = np.stack([((chunks == 1) * weights).sum(-1, dtype=np.uint64),
+                               ((chunks == -1) * weights).sum(-1, dtype=np.uint64)], -1)
+            planes = np.ascontiguousarray(planes.reshape(-1))
+            keep.append(planes)
+            packed[len(packed)] = Packed(planes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)), sc.ctypes.data_as(f))
         return Ternary(c.ctypes.data_as(i8), sc.ctypes.data_as(f))
 
     embed = np.ascontiguousarray(model.embed.weight.detach().float().numpy())
@@ -477,25 +495,54 @@ def c_step(model):
               floats(lambda l: model.norms[list(model.layers).index(l)].weight), floats(lambda l: l.conv),
               tern(lambda l: l.w_in), floats(lambda l: l.bias), tern(lambda l: l.w_out), tern(lambda l: l.proj.weight),
               floats(lambda l: l.dt_bias), floats(lambda l: -torch.exp(l.A_log)), tern(lambda l: l.U))
+    if packed:  # w_in, w_out, proj, U in the order tern() saw them
+        m.w_in2, m.w_out2, m.proj2, m.U2 = packed[0], packed[1], packed[2], packed[3]
+    m.state_bf16 = int(state_bf16)
     N = 2 ** (cfg.depth + 1) - 1
-    scratch = np.zeros(5 * cfg.d_model + 2 * cfg.state + (3 + cfg.trees) * cfg.value + cfg.trees, dtype=np.float32)
+    P = 2 * cfg.state + 2 * cfg.value + cfg.trees
+    scratch = np.zeros(8 * cfg.d_model + 2 * P + 4 * cfg.trees * cfg.value + 64, dtype=np.float32)  # with room to align
     lib.tss_step.argtypes = [ctypes.POINTER(Model), f, f, ctypes.c_int, f, f]
-    lib.tss_run.argtypes = [ctypes.POINTER(Model), f, f, ctypes.POINTER(ctypes.c_int), ctypes.c_int, f, f]
+    for fn in (lib.tss_run, lib.tss_run_naive):
+        fn.argtypes = [ctypes.POINTER(Model), f, f, ctypes.POINTER(ctypes.c_int), ctypes.c_int, f, f]
 
     def new_state():
         return (np.zeros(cfg.n_layer * cfg.trees * N * cfg.state * cfg.value, dtype=np.float32),
                 np.zeros(cfg.n_layer * max(cfg.d_conv - 1, 1) * cfg.d_model, dtype=np.float32))
 
+    lib.tss_run_batch.argtypes = [ctypes.POINTER(Model), ctypes.c_int, ctypes.c_void_p, f, ctypes.POINTER(ctypes.c_int),
+                                  ctypes.c_int, f, f, ctypes.c_int]
+    lib.tss_run_batch.restype = ctypes.c_int
+    state_elems = cfg.n_layer * cfg.trees * N * cfg.state * cfg.value
+    hist_elems = cfg.n_layer * max(cfg.d_conv - 1, 1) * cfg.d_model
+
+    def new_batch(nb):
+        return (np.zeros(nb * state_elems, dtype=np.uint16 if state_bf16 else np.float32),
+                np.zeros(nb * hist_elems, dtype=np.float32))
+
+    batch_scratch = {}
+
+    def run_batch(tokens, state, logits, threads=1):
+        """tokens (n, nb): n steps of nb sequences at once, on 2-bit weights (AVX-512), the sequences split across
+        threads. logits (nb, vocab): the last step's."""
+        n, nb = tokens.shape
+        sc = batch_scratch.setdefault(nb, np.zeros(nb * (5 * cfg.d_model + 2 * P + 2 * (cfg.trees + 1) * cfg.value + 128)
+                                                  + 16 * nb + 64, dtype=np.float32))
+        tok = np.ascontiguousarray(tokens, dtype=np.int32)
+        err = lib.tss_run_batch(ctypes.byref(m), nb, state[0].ctypes.data, state[1].ctypes.data_as(f),
+                                tok.ctypes.data_as(ctypes.POINTER(ctypes.c_int)), n, logits.ctypes.data_as(f), sc.ctypes.data_as(f),
+                                threads)
+        assert err == 0, "tss_run_batch: needs AVX-512BW, d and the group multiples of 64, value of 16, nb <= 64"
+
     def step(token, state, logits):
         lib.tss_step(ctypes.byref(m), state[0].ctypes.data_as(f), state[1].ctypes.data_as(f), int(token),
                      logits.ctypes.data_as(f), scratch.ctypes.data_as(f))
 
-    def run(tokens, state, logits):
+    def run(tokens, state, logits, naive=False):
         tok = np.ascontiguousarray(tokens, dtype=np.int32)
-        lib.tss_run(ctypes.byref(m), state[0].ctypes.data_as(f), state[1].ctypes.data_as(f),
+        (lib.tss_run_naive if naive else lib.tss_run)(ctypes.byref(m), state[0].ctypes.data_as(f), state[1].ctypes.data_as(f),
                     tok.ctypes.data_as(ctypes.POINTER(ctypes.c_int)), len(tok), logits.ctypes.data_as(f), scratch.ctypes.data_as(f))
 
-    step.keep, step.new_state, step.run = (keep, m), new_state, run
+    step.keep, step.new_state, step.run, step.new_batch, step.run_batch = (keep, m), new_state, run, new_batch, run_batch
     return step
 
 
@@ -524,16 +571,40 @@ def bench(a):
           f"{cfg.depth} ({2 ** (cfg.depth + 1) - 1} nodes, {cfg.depth + 1} visited), node state {cfg.state} x {cfg.value}, readout {cfg.readout}, "
           f"ternary weights, 8-bit activations")
     print(f"  C step vs PyTorch recurrence over {len(ids)} tokens: worst logit difference {worst:.1e} relative")
+    naive_state, naive_logits = step.new_state(), np.zeros_like(logits)
+    for t in range(len(ids)):  # the fast step against the plain C one, same tokens, same states
+        step.run(ids[t : t + 1].numpy(), naive_state, naive_logits, naive=True)
+    print(f"  fast C step vs plain C step: worst logit difference "
+          f"{float(np.abs(logits - naive_logits).max() / (np.abs(naive_logits).max() + 1e-9)):.1e} relative")
     tokens = np.random.default_rng(0).integers(0, cfg.vocab_size, a.tokens)
     t0 = time.perf_counter()
     step.run(tokens, cs, logits)  # the loop in C: no Python per token
     c_rate = a.tokens / (time.perf_counter() - t0)
     t0 = time.perf_counter()
+    step.run(tokens, naive_state, naive_logits, naive=True)
+    naive_rate = a.tokens / (time.perf_counter() - t0)
+    t0 = time.perf_counter()
     for t in range(200):
         model.step(torch.tensor([t % cfg.vocab_size]), states)
     py_rate = 200 / (time.perf_counter() - t0)
-    print(f"  one core, batch 1: C {c_rate:,.0f} tokens/s ({1e6 / c_rate:.1f} us/token); PyTorch step {py_rate:,.0f} tokens/s")
-
+    print(f"  one core, batch 1: fast C {c_rate:,.0f} tokens/s ({1e6 / c_rate:.1f} us/token); plain C {naive_rate:,.0f} "
+          f"({1e6 / naive_rate:.1f} us/token); PyTorch step {py_rate:,.0f} tokens/s")
+    if cfg.d_model % 64 == 0 and cfg.value % 16 == 0:  # the 2-bit kernel (AVX-512): sequences at once, on cores
+        cores = os.cpu_count()
+        for bf in (False, True):
+            st2 = c_step(model, state_bf16=bf)
+            for nb, threads in ((1, 1), (4, 1), (16, 1), (cores, cores), (4 * cores, cores), (16 * cores, cores)):
+                state, lg = st2.new_batch(nb), np.zeros((nb, cfg.vocab_size), dtype=np.float32)
+                toks = np.random.default_rng(1).integers(0, cfg.vocab_size, (max(a.tokens // nb, 50), nb))
+                try:
+                    t0 = time.perf_counter()
+                    st2.run_batch(toks, state, lg, threads)
+                except AssertionError:
+                    print("  2-bit kernel: not available on this CPU (needs AVX-512BW)")
+                    return
+                rate = toks.size / (time.perf_counter() - t0)
+                print(f"  2-bit weights, {'bf16' if bf else 'f32 '} state, {nb:3d} sequences on {threads} core{'s' if threads > 1 else ' '}: "
+                      f"{rate:9,.0f} tokens/s  ({1e6 / rate * threads:6.1f} core-us/token; state {state[0].nbytes / nb / 1e6:.1f} MB a sequence)")
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
