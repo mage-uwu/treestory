@@ -28,6 +28,19 @@ output; a token walks one root-to-leaf path (right if logit > 0). The forest has
   hard step going forward, sigmoid(logit) going backward, so a branch logit learns from the difference between the
   outputs of its two subtrees, each followed down by the token's own decisions.
 
+Stateful deep trees (an experiment, off by default; not GTS3): with --deep-ctx-levels K every node on the top K
+levels of each deep tree is a channel of the same kind of SSM, written only by the tokens that visit it:
+      ctx[t, a] = sum_{s != t, s visited a} decay(s -> t) <C[t], B[s]> dt_s logit_s(a),   coef = gelu(logit) + ctx
+so the root hears every token, as a bank tree does, and a level-k node only the tokens that made the same k
+decisions: context clustered by the trees' own routing. One clock per tree; B, C_fwd and C_bwd (state
+--deep-ctx-state) from one more ternary projection per layer. Routes still depend on the logits alone, so the context
+is computed after the walk and changes coefficients, not paths. Every token reads every stateful node, on its path or
+not: the straight-through gradient compares a path with its alternative, and the alternative's coefficients are what
+the token would have read there. The tokens' own writes are not moved in that comparison (the visits carry no
+gradient). It costs nothing at K = 0 (GTS3's checkpoints load and compute as before) and with K = 4 adds 0.56M
+parameters. On a GPU the context runs in the bank's scan, but the walk runs in PyTorch's gathers, not the Triton walk.
+Starting from GTS3: train --init checkpoints/bert110m/phase3/checkpoint.pt --deep-ctx-levels 4 ...
+
 Each kind first mixes neighbours with its own centred depthwise conv (width 3, identity at init) and quantises the
 result to 8-bit integers per token. node_in, node_out and ctx_proj are ternary: absmean codes in {-1, 0, 1} times
 one scale per group of 128 weights, recomputed every step from latent float weights (straight-through). Embeddings,
@@ -90,6 +103,8 @@ class GTSConfig:
     bank_state: int = 16
     deep_trees: int = 4
     deep_depth: int = 9
+    deep_ctx_levels: int = 0  # stateful deep trees: the top levels whose nodes carry context (0: GTS3, stateless)
+    deep_ctx_state: int = 16
     d_conv: int = 3
     ternary_group: int = 128
     act_bits: int = 8
@@ -174,26 +189,48 @@ class Trees(nn.Module):
         x = self.conv1d.bias + sum(up[:, j : j + length] * w[:, j] for j in range(k))
         return quantize_activations(x, self.cfg.act_bits)
 
-
-class Bank(Trees):
-    """Depth-0 trees with bidirectional SSM context, one clock per head."""
-
-    def __init__(self, cfg):
-        super().__init__(cfg, cfg.bank_trees, 0)
-        n, H = cfg.bank_state, cfg.bank_heads
-        self.ctx_proj = nn.Linear(cfg.d_model, 3 * n + H, bias=False)  # [B, C_fwd, C_bwd, dt per head]
+    def add_clocks(self, n, H):
+        """The SSM's parameters: one projection to [B, C_fwd, C_bwd, dt per head] and a decay rate per head."""
+        self.ctx_state = n
+        self.ctx_proj = nn.Linear(self.cfg.d_model, 3 * n + H, bias=False)
         dt = torch.exp(torch.rand(H) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)).clamp(min=1e-4)
         self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))  # inverse softplus, as Mamba-2
         self.A_log = nn.Parameter(torch.log(torch.empty(H).uniform_(1, 16)))
         self.dt_bias._no_weight_decay = self.A_log._no_weight_decay = True
 
     def signals(self, x, mask):
-        n = self.cfg.bank_state
+        n = self.ctx_state
         p = F.linear(x, self.q(self.ctx_proj.weight))
         B, C_fwd, C_bwd = p[..., :n], p[..., n : 2 * n], p[..., 2 * n : 3 * n]
         dt = F.softplus(p[..., 3 * n :] + self.dt_bias)  # (b, l, heads)
         a = dt * -torch.exp(self.A_log.float()) * mask.unsqueeze(-1)  # per-token log-decay; padding stops no clock
         return B, C_fwd, C_bwd, dt, a
+
+
+def bi_context(C_fwd, C_bwd, B, src, a):
+    """The bidirectional context, the token's own term excluded. C_fwd, C_bwd, B: (b, l, n); src: (b, l, heads, p),
+    what each token writes; a: (b, l, heads), the log-decays. Returns (b, l, heads, p), float32 at least:
+        ctx[t] = sum_{s<t} exp(a_{s+1}+..+a_t) <C_fwd[t], B[s]> src[s] + sum_{s>t} exp(a_t+..+a_{s-1}) <C_bwd[t], B[s]> src[s]"""
+    if use_kernels(src):  # the chunked scan, linear in length, both directions in the same launches
+        return gts_scan_bi(C_fwd, C_bwd, B, src, a)
+    length = src.shape[1]
+    # weights[t, s, h] = <C[t], B[s]> * decay between s and t on head h's clock, both directions, zero at s = t
+    Bf, a = _f32(B), _f32(a)
+    cs = torch.cumsum(a, 1)
+    cx = cs - a
+    lower = torch.ones(length, length, dtype=torch.bool, device=src.device).tril(-1)[None, :, :, None]
+    fwd = torch.exp((cs[:, :, None] - cs[:, None, :]).masked_fill(~lower, -torch.inf))
+    bwd = torch.exp((cx[:, None, :] - cx[:, :, None]).masked_fill(~lower.transpose(1, 2), -torch.inf))
+    w = (_f32(C_fwd) @ Bf.transpose(1, 2)).unsqueeze(-1) * fwd + (_f32(C_bwd) @ Bf.transpose(1, 2)).unsqueeze(-1) * bwd
+    return torch.einsum("btsh,bshp->bthp", w, _f32(src))
+
+
+class Bank(Trees):
+    """Depth-0 trees with bidirectional SSM context, one clock per head."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg, cfg.bank_trees, 0)
+        self.add_clocks(cfg.bank_state, cfg.bank_heads)
 
     def forward(self, u, mask):
         b, length, _ = u.shape
@@ -202,18 +239,7 @@ class Bank(Trees):
         logit = F.linear(x, self.q(self.node_in), self.node_bias)  # (b, l, trees)
         B, C_fwd, C_bwd, dt, a = self.signals(x, mask)
         src = dt.repeat_interleave(T // H, -1) * mask.unsqueeze(-1) * logit  # what each token writes to each tree
-        if use_kernels(x):  # the chunked scan, linear in length, both directions in the same launches
-            ctx = gts_scan_bi(C_fwd, C_bwd, B, src.reshape(b, length, H, T // H), a).reshape(b, length, T)
-            return ((F.gelu(logit) + ctx.to(logit.dtype)) @ self.q(self.node_out)) * mask.unsqueeze(-1)
-        # weights[t, s, h] = <C[t], B[s]> * decay between s and t on head h's clock, both directions, zero at s = t
-        Bf, a = _f32(B), _f32(a)
-        cs = torch.cumsum(a, 1)
-        cx = cs - a
-        lower = torch.ones(length, length, dtype=torch.bool, device=u.device).tril(-1)[None, :, :, None]
-        fwd = torch.exp((cs[:, :, None] - cs[:, None, :]).masked_fill(~lower, -torch.inf))
-        bwd = torch.exp((cx[:, None, :] - cx[:, :, None]).masked_fill(~lower.transpose(1, 2), -torch.inf))
-        w = (_f32(C_fwd) @ Bf.transpose(1, 2)).unsqueeze(-1) * fwd + (_f32(C_bwd) @ Bf.transpose(1, 2)).unsqueeze(-1) * bwd
-        ctx = torch.einsum("btsh,bshp->bthp", w, _f32(src).view(b, length, H, T // H)).reshape(b, length, T)
+        ctx = bi_context(C_fwd, C_bwd, B, src.view(b, length, H, T // H), a).reshape(b, length, T)
         coef = F.gelu(logit) + ctx.to(logit.dtype)
         return (coef @ self.q(self.node_out)) * mask.unsqueeze(-1)
 
@@ -232,39 +258,50 @@ def _walk(L, depth):
     return torch.stack(path, -1)
 
 
+def _node_coef(L3, E3, idx):
+    """A node's coefficient at the node indices idx: gelu(logit), plus its context when the tree is stateful."""
+    c = F.gelu(_f32(L3.gather(2, idx)))
+    return c if E3 is None else c + _f32(E3.gather(2, idx))
+
+
 class RouteSTE(torch.autograd.Function):
-    """out = sum over each token's path nodes of gelu(logit) * W[node], with the straight-through branch gradient,
-    without forming the path weights (``Deep.reference`` is the definition). Backward, with g = dout @ W^T, the only
-    nonzero logit gradients are at path nodes; at path node a on level k:
-        dL[a] = gelu'(L[a]) g[a] + sign * (on[a] - alt[a]) * sigmoid'(L[a] / temp) / temp
-    on[a]: gelu * g summed over the path below a; alt[a]: the same over the chain from a's other child following the
+    """out = sum over each token's path nodes of coef[node] * W[node], with the straight-through branch gradient,
+    without forming the path weights (``Deep.reference`` is the definition). coef = gelu(logit), plus E, the context,
+    at the top E.shape[-1] nodes of each tree (stateful trees; E: (tokens, trees, nodes with context) or None).
+    Backward, with g = dout @ W^T, the only nonzero logit and context gradients are at path nodes; at path node a on
+    level k:
+        dL[a] = gelu'(L[a]) g[a] + sign * (on[a] - alt[a]) * sigmoid'(L[a] / temp) / temp,   dE[a] = g[a]
+    on[a]: coef * g summed over the path below a; alt[a]: the same over the chain from a's other child following the
     token's own decisions; sign +1 if the token went right at a."""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
-    def forward(ctx, L, W, n_trees, depth, temp):
+    def forward(ctx, L, W, n_trees, depth, temp, E=None):
         N = L.shape[0]
         L3 = L.view(N, n_trees, -1)
+        E3 = None if E is None else F.pad(E, (0, L3.shape[2] - E.shape[2]))
         path = _walk(L3, depth)
-        A = torch.zeros_like(L3).scatter(2, path, F.gelu(_f32(L3.gather(2, path))).to(L.dtype)).view(N, -1)
-        ctx.save_for_backward(L, W)
+        A = torch.zeros_like(L3).scatter(2, path, _node_coef(L3, E3, path).to(L.dtype)).view(N, -1)
+        ctx.save_for_backward(L, W, E)
         ctx.cfg = n_trees, depth, temp
         return A @ W
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, dout):
-        L, W = ctx.saved_tensors
+        L, W, E = ctx.saved_tensors
         n_trees, depth, temp = ctx.cfg
         N = L.shape[0]
         L3 = L.view(N, n_trees, -1)
+        E3 = None if E is None else F.pad(E, (0, L3.shape[2] - E.shape[2]))
         path = _walk(L3, depth)
         Lp = _f32(L3.gather(2, path))
-        A = torch.zeros_like(L3).scatter(2, path, F.gelu(Lp).to(L.dtype)).view(N, -1)
+        cp = _node_coef(L3, E3, path)
+        A = torch.zeros_like(L3).scatter(2, path, cp.to(L.dtype)).view(N, -1)
         dW = A.t() @ dout
         G = (dout @ W.t()).view(N, n_trees, -1)
         Gp = _f32(G.gather(2, path))
-        c = F.gelu(Lp) * Gp
+        c = cp * Gp
         on = c.sum(-1, keepdim=True) - c.cumsum(-1)  # the path strictly below each node
         d = _dgelu(Lp) * Gp
         for k in range(depth):
@@ -273,24 +310,55 @@ class RouteSTE(torch.autograd.Function):
             alt = torch.zeros_like(on[..., k])
             for _ in range(depth - k):
                 ls = _f32(L3.gather(2, s.unsqueeze(-1)).squeeze(-1))
-                alt = alt + F.gelu(ls) * _f32(G.gather(2, s.unsqueeze(-1)).squeeze(-1))
+                alt = alt + _node_coef(L3, E3, s.unsqueeze(-1)).squeeze(-1) * _f32(G.gather(2, s.unsqueeze(-1)).squeeze(-1))
                 s = 2 * s + 1 + (ls > 0).long()
             p = torch.sigmoid(Lp[..., k] / temp)
             d[..., k] += torch.where(right, on[..., k] - alt, alt - on[..., k]) * p * (1 - p) / temp
         dL = torch.zeros(L3.shape, dtype=d.dtype, device=L.device).scatter(2, path, d).view(N, -1).to(L.dtype)
-        return dL, dW, None, None, None
+        dE = None
+        if E is not None:
+            dE = torch.zeros(L3.shape, dtype=Gp.dtype, device=L.device).scatter(2, path, Gp)[..., : E.shape[2]].to(E.dtype)
+        return dL, dW, None, None, None, dE
 
 
 class Deep(Trees):
-    """Stateless deep trees, hard routing with the straight-through branch gradient."""
+    """Deep trees, hard routing with the straight-through branch gradient. Stateless (GTS3), or with
+    deep_ctx_levels = K, stateful: each node on the top K levels of each tree carries the bidirectional context of the
+    tokens that visited it. One clock per tree; B, C_fwd and C_bwd shared by all of a layer's trees."""
 
     def __init__(self, cfg):
         super().__init__(cfg, cfg.deep_trees, cfg.deep_depth)
+        self.ctx_levels = min(cfg.deep_ctx_levels, cfg.deep_depth + 1)
+        if self.ctx_levels:
+            self.add_clocks(cfg.deep_ctx_state, cfg.deep_trees)
+
+    def context(self, x, al, mask, visit=None):
+        """al: (b, l, trees, nodes), every node's logit. Context at the top 2^K - 1 nodes of each tree, for every token,
+        on its path or not (off it, what the token would read had it gone there; the branch gradient needs it):
+            ctx[t, a] = sum_{s != t, s visited a} decay(s -> t) <C[t], B[s]> dt_s logit_s(a)
+        visit (b, l, trees, 2^K - 1): which tokens visited which nodes, by default the walk on al. Going forward a
+        token's route depends only on the logits, so the context changes coefficients, not paths."""
+        b, length, T, _ = al.shape
+        m = 2**self.ctx_levels - 1
+        top = al[..., :m]
+        if visit is None:
+            with torch.no_grad():
+                path = _walk(top.reshape(b * length, T, m), self.ctx_levels - 1).view(b, length, T, -1)
+                visit = torch.zeros_like(top).scatter(-1, path, 1.0)
+        B, C_fwd, C_bwd, dt, a = self.signals(x, mask)
+        src = (dt * mask.unsqueeze(-1)).unsqueeze(-1) * visit * top  # what each token writes to each node it visits
+        return bi_context(C_fwd, C_bwd, B, src, a)
 
     def forward(self, u, mask):
         b, length, d = u.shape
         x = self.local_mix(u, mask)
         w_in, w_out, bias = self.q(self.node_in), self.q(self.node_out), self.node_bias
+        if self.ctx_levels:  # the context through bi_context (the bank's scan on a GPU), the walk in PyTorch
+            L = F.linear(x, w_in, bias)
+            E = self.context(x, L.view(b, length, self.n_trees, -1), mask).to(L.dtype)
+            E = E.reshape(b * length, self.n_trees, -1)
+            out = RouteSTE.apply(L.reshape(b * length, -1), w_out, self.n_trees, self.depth, self.cfg.route_ste_temp, E)
+            return out.view(b, length, d).to(x.dtype) * mask.unsqueeze(-1)
         if use_kernels(x):  # Triton walk; node rows padded to a multiple of 64 (4 x 1,023 misaligns every GEMM)
             pad = -w_in.shape[0] % 64
             w_in, w_out, bias = F.pad(w_in, (0, 0, 0, pad)), F.pad(w_out, (0, 0, 0, pad)), F.pad(bias, (0, pad))
@@ -303,7 +371,8 @@ class Deep(Trees):
 
     def reference(self, u, mask):
         """The definition: every node's coefficient times its path weight, the product of the branch values above
-        it (the hard step going forward, sigmoid(logit / temp) going backward)."""
+        it (the hard step going forward, sigmoid(logit / temp) going backward). In a stateful tree a node's
+        coefficient adds its context, written by the tokens whose (hard) path weight there is 1."""
         b, length, _ = u.shape
         x = self.local_mix(u, mask)
         al = F.linear(x, self.q(self.node_in), self.node_bias).view(b, length, self.n_trees, self.n_nodes)
@@ -313,8 +382,13 @@ class Deep(Trees):
         for k in range(self.depth):
             g = right[..., 2**k - 1 : 2 ** (k + 1) - 1]
             levels.append(torch.stack([levels[-1] * (1 - g), levels[-1] * g], -1).flatten(3))  # children 2i+1, 2i+2
-        pi = torch.cat(levels, -1).flatten(2)
-        return ((pi * F.gelu(al.flatten(2))) @ self.q(self.node_out)) * mask.unsqueeze(-1)
+        pi = torch.cat(levels, -1)  # (b, l, trees, nodes)
+        coef = F.gelu(al)
+        if self.ctx_levels:
+            m = 2**self.ctx_levels - 1
+            ctx = self.context(x, al, mask, visit=pi.detach()[..., :m])
+            coef = coef + F.pad(ctx.to(al.dtype), (0, self.n_nodes - m))
+        return ((pi * coef).flatten(2) @ self.q(self.node_out)) * mask.unsqueeze(-1)
 
 
 class Mixer(nn.Module):
@@ -389,12 +463,16 @@ class GTS(nn.Module):
         return F.linear(h, w, bias)
 
 
+def config_from(rc):
+    return GTSConfig(**{f.name: rc[f.name] for f in fields(GTSConfig) if f.name in rc})
+
+
 def load(path, device="cpu"):
     """A nanoGTS ckpt.pt, or the repository's checkpoint.pt (float) or binarized.pt (2-bit ternary codes and scales)."""
     blob = torch.load(path, map_location="cpu", weights_only=False)
     rc = blob["config"]
     assert rc.get("mixer", "mixed") == "mixed" and not rc.get("causal") and rc.get("loops", 1) == 1, "not a GTS3-style model"
-    model = GTS(GTSConfig(**{f.name: rc[f.name] for f in fields(GTSConfig) if f.name in rc}))
+    model = GTS(config_from(rc))
     if "model" in blob:
         model.load_state_dict(blob["model"])
         return model.to(device)
@@ -934,7 +1012,13 @@ def train(a):
     torch.manual_seed(a.seed)
     train_data = np.memmap(os.path.join(a.data, "train.bin"), dtype=np.uint16, mode="r")
     val_data = np.memmap(os.path.join(a.data, "val.bin"), dtype=np.uint16, mode="r")
-    model = GTS(GTSConfig()).to(device)
+    ck = torch.load(a.resume, map_location="cpu", weights_only=False) if a.resume else None
+    cfg = config_from(ck["config"]) if ck else GTSConfig(deep_ctx_levels=a.deep_ctx_levels, deep_ctx_state=a.deep_ctx_state)
+    model = GTS(cfg).to(device)
+    if a.init:  # another model's weights, e.g. GTS3's; parameters it lacks (the trees' context) keep their init
+        missing, unexpected = model.load_state_dict(load(a.init).state_dict(), strict=False)
+        assert not unexpected, f"--init has parameters this model lacks: {unexpected}"
+        print(f"initialised from {a.init}; {len(missing)} parameter tensors new", flush=True)
     if device == "cuda" and a.compile:
         model.backbone.compile_blocks()
     decay = [p for p in model.parameters() if p.ndim >= 2 and not getattr(p, "_no_weight_decay", False)]
@@ -943,8 +1027,7 @@ def train(a):
                             lr=a.lr, betas=(0.9, 0.98), eps=1e-6, fused=device == "cuda")
     gen = torch.Generator().manual_seed(a.seed)
     step, lr0, curve = 0, 0.0, []
-    if a.resume:  # a new phase: weights, AdamW state, step and sampler carry over; warm from the last rate
-        ck = torch.load(a.resume, map_location="cpu", weights_only=False)
+    if ck:  # a new phase: config, weights, AdamW state, step and sampler carry over; warm from the last rate
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         gen.set_state(ck["generator"])
@@ -1022,13 +1105,37 @@ def selftest(kernels=False):
     mask = torch.ones(2, 12, dtype=torch.float64)
     mask[1, 9:] = 0
 
-    # deep trees: the walk Function against the path-weight definition, values and every gradient
-    out, ref = m.deep(u, mask), m.deep.reference(u, mask)
-    g = torch.randn_like(out)
-    ps = [u, m.deep.node_in, m.deep.node_bias, m.deep.node_out, m.deep.conv1d.weight]
-    g1, g2 = torch.autograd.grad(out, ps, g), torch.autograd.grad(ref, ps, g)
-    assert torch.allclose(out, ref, atol=1e-10), "deep trees: forward"
-    assert all(torch.allclose(x, y, atol=1e-9) for x, y in zip(g1, g2)), "deep trees: straight-through gradient"
+    # deep trees, stateless and stateful (top 3 of 5 levels): the walk Function against the path-weight definition,
+    # values and every gradient
+    for levels in (0, 3):
+        torch.manual_seed(1)
+        deep = Deep(GTSConfig(**{**asdict(cfg), "deep_ctx_levels": levels})).double()
+        deep.node_in.data *= 8
+        out, ref = deep(u, mask), deep.reference(u, mask)
+        g = torch.randn_like(out)
+        ps = [u] + [p for p in deep.parameters()]
+        g1, g2 = torch.autograd.grad(out, ps, g), torch.autograd.grad(ref, ps, g)
+        assert torch.allclose(out, ref, atol=1e-10), f"deep trees ({levels} stateful levels): forward"
+        assert all(torch.allclose(x, y, atol=1e-9) for x, y in zip(g1, g2)), f"deep trees ({levels} stateful levels): gradient"
+    # stateful deep trees: the context against token-at-a-time states, one per node, written only by its visitors
+    with torch.no_grad():
+        x = deep.local_mix(u, mask)
+        al = F.linear(x, deep.q(deep.node_in), deep.node_bias).view(2, 12, deep.n_trees, -1)
+        B, C_fwd, C_bwd, dt, a = deep.signals(x, mask)
+        n_top = 2**levels - 1
+        want = torch.zeros(2, 12, deep.n_trees, n_top, dtype=torch.float64)
+        for b in range(2):
+            for order, C in ((range(12), C_fwd), (range(11, -1, -1), C_bwd)):
+                state = torch.zeros(deep.n_trees, n_top, cfg.deep_ctx_state, dtype=torch.float64)
+                for t in order:
+                    state = state * torch.exp(a[b, t]).view(-1, 1, 1)
+                    want[b, t] += state @ C[b, t]
+                    for tree in range(deep.n_trees):
+                        node = 0
+                        for _ in range(levels):  # the token's own route through the stateful levels
+                            state[tree, node] += dt[b, t, tree] * mask[b, t] * al[b, t, tree, node] * B[b, t]
+                            node = 2 * node + 1 + int(al[b, t, tree, node] > 0)
+        assert torch.allclose(deep.context(x, al, mask), want, atol=1e-9), "stateful deep trees: context"
 
     # bank: the quadratic form against token-at-a-time states, read then written, forward and backward
     with torch.no_grad():
@@ -1048,7 +1155,8 @@ def selftest(kernels=False):
                     state = state + (dt[b, t, head] * mask[b, t] * logit[b, t]).unsqueeze(-1) * B[b, t]
         want = ((F.gelu(logit) + ctx) @ bank.q(bank.node_out)) * mask.unsqueeze(-1)
         assert torch.allclose(bank(u, mask), want, atol=1e-9), "bank: context"
-    print("selftest passed: deep-tree straight-through walk == path-weight definition; bank quadratic form == recurrence")
+    print("selftest passed: deep-tree straight-through walk == path-weight definition (stateless and stateful); "
+          "node context == per-node recurrence; bank quadratic form == recurrence")
     USE_KERNELS = True
     if kernels:
         selftest_kernels()
@@ -1061,27 +1169,28 @@ def selftest_kernels():
     assert HAVE_TRITON, "needs triton"
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     assert dev == "cuda" or os.environ.get("TRITON_INTERPRET") == "1", "no GPU: set TRITON_INTERPRET=1"
-    torch.manual_seed(0)
-    cfg = GTSConfig(d_model=64, n_layer=2, vocab_size=1100, bank_trees=8, bank_heads=2, bank_state=16, deep_trees=2,
-                    deep_depth=4, ternary_group=32)
-    model = GTS(cfg).to(dev)
-    ids = torch.randint(999, 1100, (2, 150), device=dev)  # 150 tokens: three chunks of the scan
-    ids[1, 120:] = 0
-    labels = torch.where(torch.rand(ids.shape, device=dev) < 0.3, ids, torch.full_like(ids, -100))
-    labels[ids == 0] = -100
-    results = []
-    for k in (False, True):
-        USE_KERNELS = k
-        model.zero_grad()
-        loss, logits = model(ids, labels)
-        loss.backward()
-        results.append((logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}))
-    USE_KERNELS = True
-    (l0, g0), (l1, g1) = results
-    rel = lambda x, y: ((x - y).norm() / (y.norm() + 1e-30)).item()  # noqa: E731
-    worst = max((rel(g1[n], g0[n]), n) for n in g0)
-    print(f"kernels vs PyTorch: logits {rel(l1, l0):.1e}, worst gradient {worst[0]:.1e} ({worst[1]}) relative")
-    assert rel(l1, l0) < 1e-4 and worst[0] < 1e-3, "the Triton paths disagree with the PyTorch ones"
+    for levels in (0, 2):  # stateless deep trees (the Triton walk), stateful ones (the bank's scan for their context)
+        torch.manual_seed(0)
+        cfg = GTSConfig(d_model=64, n_layer=2, vocab_size=1100, bank_trees=8, bank_heads=2, bank_state=16, deep_trees=2,
+                        deep_depth=4, ternary_group=32, deep_ctx_levels=levels)
+        model = GTS(cfg).to(dev)
+        ids = torch.randint(999, 1100, (2, 150), device=dev)  # 150 tokens: three chunks of the scan
+        ids[1, 120:] = 0
+        labels = torch.where(torch.rand(ids.shape, device=dev) < 0.3, ids, torch.full_like(ids, -100))
+        labels[ids == 0] = -100
+        results = []
+        for k in (False, True):
+            USE_KERNELS = k
+            model.zero_grad()
+            loss, logits = model(ids, labels)
+            loss.backward()
+            results.append((logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}))
+        USE_KERNELS = True
+        (l0, g0), (l1, g1) = results
+        rel = lambda x, y: ((x - y).norm() / (y.norm() + 1e-30)).item()  # noqa: E731
+        worst = max((rel(g1[n], g0[n]), n) for n in g0)
+        print(f"{levels} stateful levels: kernels vs PyTorch: logits {rel(l1, l0):.1e}, worst gradient {worst[0]:.1e} ({worst[1]}) relative")
+        assert rel(l1, l0) < 1e-4 and worst[0] < 1e-3, "the Triton paths disagree with the PyTorch ones"
     print("selftest --kernels passed")
 
 
@@ -1098,7 +1207,10 @@ def main():
     t.add_argument("--steps", type=int, required=True, help="the absolute step to end this phase at")
     t.add_argument("--lr", type=float, required=True)
     t.add_argument("--warmup", type=int, default=1000)
-    t.add_argument("--resume")
+    t.add_argument("--resume", help="continue a run (its config, weights, optimizer and sampler)")
+    t.add_argument("--init", help="start from another checkpoint's weights only, e.g. GTS3's, with a fresh optimizer")
+    t.add_argument("--deep-ctx-levels", type=int, default=0, help="stateful deep trees: top levels with context")
+    t.add_argument("--deep-ctx-state", type=int, default=16)
     t.add_argument("--batch-size", type=int, default=64)
     t.add_argument("--micro-batch", type=int, default=64, help="sequences per forward pass; gradients accumulate exactly")
     t.add_argument("--seq-len", type=int, default=512)
