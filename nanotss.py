@@ -43,13 +43,20 @@ Three forms of one function
   AVX2 path on int8 codes; a plain path), the trees walked in lockstep, both children's rows prefetched, the chosen
   child's state; optional bfloat16 states; several sequences walked together and split across cores (OpenMP).
 
+* the C training step (``C_TRAIN_SOURCE``, ``CTrainer``): training on a CPU, sparse. The tree forward pass records a
+  tape; the backward pass touches only what the forward touched: the visited node rows, the visited nodes' states (an
+  adjoint state per node, run backward in time), and for the branch gradient the other subtree's nodes as scalars
+  <g, out> only; dense backprop for the rest (proj, U, conv, norms, the output layer). AdamW, lazy on node rows (a row
+  moves in the steps that touch it), the touched rows' ternary codes recomputed; sequences across threads. Its
+  gradients are autograd's (float64, ``selftest --c``); it trains the model's own tensors in place.
+
 ``selftest`` checks, in float64: the training form against the recurrence (routes included), its gradients against
 ``reference`` (the path-weight definition over every node, the counterfactual reads included), and the scan against
 a loop. ``selftest --kernels`` checks the Triton kernels against PyTorch through the whole model. ``bench`` checks
 the C steps against the recurrence and times them.
 
-    python nanotss.py selftest [--kernels]    # --kernels without a GPU: TRITON_INTERPRET=1 (slow)
-    python nanotss.py mqar [--float] [--no-memory] [--depth 0] [--readout level|tree|layer]
+    python nanotss.py selftest [--kernels | --c]  # --kernels without a GPU: TRITON_INTERPRET=1 (slow)
+    python nanotss.py mqar [--engine torch|c] [--float] [--no-memory] [--depth 0] [--readout level|tree|layer]
     python nanotss.py bench                   # C inference vs the recurrence, then tokens/s
 
 Results so far (one seed each)
@@ -69,6 +76,9 @@ weights, is what a stateful tree moves: 1 KB a visit in float32 against 128 byte
 Training cost per token is flat in length (PyTorch on 4 CPU threads, 2 layers, d 64: 240 - 300 us/token from 64 to
 4,096 tokens). The Triton kernels match PyTorch in the interpreter (logits 2e-7, gradients <= 1.5e-4); their speed on a
 GPU is unmeasured. Not yet trained on language.
+Training on a CPU, the sparse C step against PyTorch (forward, backward, AdamW; same model, same CPU, first version
+without SIMD): 6 - 7x on one thread, 9 - 11x on four (recall-size model: 49K tokens/s on 4 threads; 12.9M parameters:
+3.9K tokens/s). MQAR with --engine c, 4 threads: recall 0.973 at 2,000 steps in 68 s (PyTorch: 0.983, 645 s on 2).
 Hard routing turns float32 rounding into an occasional different branch (an activation within rounding of zero), as in
 GTS: the C kernels agree with each other to rounding, and with PyTorch but for such tokens.
 """
@@ -837,20 +847,25 @@ def mqar(a):
                  state=a.state, value=a.value, memory=a.memory, readout=a.readout, ternary=a.quant,
                  act_bits=8 if a.quant else 0)
     model = TSS(cfg)
-    print(f"tss mqar: {sum(p.numel() for p in model.parameters()) / 1e3:.0f}K parameters, memory={a.memory}, "
+    trainer = CTrainer(model, threads=a.threads, lr=a.lr) if a.engine == "c" else None
+    print(f"tss mqar ({a.engine}): {sum(p.numel() for p in model.parameters()) / 1e3:.0f}K parameters, memory={a.memory}, "
           f"depth {a.depth}, readout {a.readout}, {'ternary' if a.quant else 'float'}, {a.kv} pairs of {a.keys} keys, length {3 * a.kv}", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, betas=(0.9, 0.98), weight_decay=0.01)
     gen, t0 = torch.Generator().manual_seed(a.seed), time.time()
     val = mqar_batch(512, a.kv, a.keys, torch.Generator().manual_seed(1234))
     for step in range(1, a.steps + 1):
-        for g in opt.param_groups:
-            g["lr"] = a.lr * min(1.0, step / 100) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.steps)))
+        lr = a.lr * min(1.0, step / 100) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.steps)))
         ids, labels = mqar_batch(a.batch, a.kv, a.keys, gen)
-        loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten())
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if trainer:  # the C sparse step: forward, backward and AdamW on the CPU, in place in the model's tensors
+            loss = torch.tensor(trainer.step(ids.numpy(), labels.numpy(), lr))
+        else:
+            for g in opt.param_groups:
+                g["lr"] = lr
+            loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten())
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
         if step % a.eval_every == 0 or step == a.steps:
             with torch.no_grad():
                 ids, labels = val
@@ -1481,29 +1496,33 @@ int tss_run_batch(const Model *m, int nb, void *h, float *hist, const int *token
 """
 
 
+def build_c(source, name, flags=()):
+    """Compile an embedded C source once (per version and flags) into ~/.cache/nanotss; returns the library's path."""
+    import hashlib
+    import subprocess
+
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "nanotss")
+    os.makedirs(cache, exist_ok=True)
+    tag = hashlib.sha1((source + " ".join(flags)).encode()).hexdigest()[:12]
+    so, src = os.path.join(cache, f"{name}_{tag}.so"), os.path.join(cache, f"{name}_{tag}.c")
+    if not os.path.exists(so):
+        with open(src, "w") as f:
+            f.write(source)
+        subprocess.check_call(["cc", "-O3", "-march=native", "-ffast-math", "-fopenmp", "-shared", "-fPIC", *flags, "-o", so, src, "-lm"])
+    return so
+
+
 def c_step(model, state_bf16=False):
     """The C step built and loaded, with the model packed for it: ternary weights as int8 codes and one scale per
     group, as the forward pass uses them (and as 2-bit planes). Returns step(token, state, logits), with .run,
     .new_state, .new_batch and .run_batch."""
     import ctypes
-    import os
-    import subprocess
 
     import numpy as np
 
     cfg = model.cfg
     assert cfg.ternary and cfg.act_bits == 8 and cfg.memory, "the C step runs the ternary, 8-bit, stateful model"
-    import hashlib
-
-    cache = os.path.join(os.path.expanduser("~"), ".cache", "nanotss")
-    os.makedirs(cache, exist_ok=True)
-    tag = hashlib.sha1(C_SOURCE.encode()).hexdigest()[:12]
-    so, src = os.path.join(cache, f"step_{tag}.so"), os.path.join(cache, f"step_{tag}.c")
-    if not os.path.exists(so):  # compiled once per version of C_SOURCE
-        with open(src, "w") as f:
-            f.write(C_SOURCE)
-        subprocess.check_call(["cc", "-O3", "-march=native", "-ffast-math", "-fopenmp", "-shared", "-fPIC", "-o", so, src, "-lm"])
-    lib = ctypes.CDLL(so)
+    lib = ctypes.CDLL(build_c(C_SOURCE, "step"))
     f, i8 = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int8)
     g = group_size(cfg.d_model, cfg.ternary_group)
 
@@ -1669,11 +1688,674 @@ def bench(a):
                       f"{rate:9,.0f} tokens/s  ({1e6 / rate * threads:6.1f} core-us/token; state {state[0].nbytes / nb / 1e6:.1f} MB a sequence)")
 
 
+# ------------------------------------------------------------------------------------------------- C training (sparse)
+
+
+C_TRAIN_SOURCE = r"""// Tree state space: the training step on a CPU, sparse. One sequence's loss and gradients, the same function and the
+// same gradients as the training form (TreeSSM.forward and autograd): a tree forward pass that records a tape,
+// then a backward pass that touches only what the forward touched. Per token and layer: the depth + 1 visited rows of
+// each tree (w_in, w_out, bias, the node's decay), the visited nodes' states (an adjoint state per node, run backward
+// in time), and for the branch gradient the other subtree's nodes as scalars <g, out> only. The dense parts (proj, U,
+// conv, norms, the output layer) are ordinary backprop. Gradients go to the latent float weights (the ternary codes and
+// 8-bit activations straight-through), into buffers the caller owns; tss_train_rows reports which node rows were hit.
+//
+// Readout per tree (cfg readout "tree"), memory on, ternary weights, 8-bit activations. REAL is float, or double for
+// checking against PyTorch's float64 autograd. Build: cc -O3 -march=native -fopenmp -shared -fPIC [-DREAL=double]
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifndef REAL
+#define REAL float
+#endif
+typedef REAL real;
+
+typedef struct {
+    int vocab, d, n_layer, T, D, n, p, K, group;
+    real temp;
+} Cfg;
+
+typedef struct {  // every tensor's layers one after another, in the layer's own shape
+    real *embed, *norm_f;               // (vocab, d), (d)
+    real *norm, *conv;                  // (d), (K, d)
+    real *w_in, *bias, *w_out, *A_log;  // (T * N, d), (T * N), (T * N, d), (T * N)
+    real *proj, *dt_bias, *U;           // (P, d), (T), (T * p, d)
+} Params;
+
+#define NODES(c) ((1 << ((c)->D + 1)) - 1)
+#define PDIM(c) (2 * (c)->n + 2 * (c)->p + (c)->T)
+
+static real gelu(real x) { return (real)0.5 * x * (1 + erf(x * (real)0.70710678118654752440)); }
+static real dgelu(real x) {
+    return (real)0.5 * (1 + erf(x * (real)0.70710678118654752440)) + x * exp((real)-0.5 * x * x) * (real)0.39894228040143267794;
+}
+static real softplus(real x) { return x > 20 ? x : log1p(exp(x)); }
+static real sigm(real x) { return 1 / (1 + exp(-x)); }
+
+static real dotr(const real *a, const real *b, int n) {
+    real s = 0;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+
+// absmean ternary per group of each row (nanotss.ternary): out = round(clamp(w / s, -1, 1)) * s, s = mean |w| of the group
+void tss_ternary(const real *w, real *out, long rows, int d, int g) {
+    for (long r = 0; r < rows; r++)
+        for (int j = 0; j < d; j += g) {
+            const real *wr = w + r * d + j;
+            real s = 0;
+            for (int i = 0; i < g; i++) s += fabs(wr[i]);
+            s = s / g;
+            if (s < (real)1e-8) s = (real)1e-8;
+            for (int i = 0; i < g; i++) {
+                real v = wr[i] / s;
+                v = v > 1 ? 1 : (v < -1 ? -1 : v);
+                out[r * d + j + i] = nearbyint(v) * s;
+            }
+        }
+}
+
+// The quantized weights of every layer, from the latent ones (the caller's buffers, Params-shaped; only w_in, w_out,
+// proj, U are written). Rows: an optimizer that touched only some rows may requantize only those.
+void tss_quantize(const Cfg *c, const Params *P, Params *Q) {
+    const long N = NODES(c), L = c->n_layer;
+    tss_ternary(P->w_in, Q->w_in, L * c->T * N, c->d, c->group);
+    tss_ternary(P->w_out, Q->w_out, L * c->T * N, c->d, c->group);
+    tss_ternary(P->proj, Q->proj, L * PDIM(c), c->d, c->group);
+    tss_ternary(P->U, Q->U, L * c->T * c->p, c->d, c->group);
+}
+
+// per-token 8-bit activations (nanotss.quantize_activations)
+static void quant8(const real *x, real *xq, int d) {
+    real m = 0;
+    for (int i = 0; i < d; i++) m = fabs(x[i]) > m ? fabs(x[i]) : m;
+    if (m < (real)1e-5) m = (real)1e-5;
+    const real scale = 127 / m;
+    for (int i = 0; i < d; i++) {
+        real v = nearbyint(x[i] * scale);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        xq[i] = v / scale;
+    }
+}
+
+static void rmsnorm_fwd(const real *x, const real *w, real *out, int d, real *r_out) {
+    const real r = 1 / sqrt(dotr(x, x, d) / d + (real)1e-5);
+    for (int i = 0; i < d; i++) out[i] = x[i] * r * w[i];
+    *r_out = r;
+}
+
+// out = x r w: dx += r (w du) - x r^3 / d sum(w du x); dw += du x r
+static void rmsnorm_bwd(const real *x, const real *w, real r, const real *du, real *dx, real *dw, int d) {
+    real s = 0;
+    for (int i = 0; i < d; i++) s += w[i] * du[i] * x[i];
+    const real k = r * r * r * s / d;
+    for (int i = 0; i < d; i++) {
+        dx[i] += r * w[i] * du[i] - x[i] * k;
+        dw[i] += du[i] * x[i] * r;
+    }
+}
+
+typedef struct {  // one layer's tape over a sequence of L tokens
+    real *xin, *u, *rn, *x, *p, *dt;   // (L, d) x3, (L), (L, P), (L, T)
+    int *node;                          // (L, T, D + 1)
+    real *s, *R, *hprev, *decay;        // (L, T, D + 1), (.., p), (.., n * p), (..)
+    int *anode;                         // the other subtrees: (L, T, D (D + 1) / 2)
+    real *as, *aR;                      // (.., ), (.., p)
+} Tape;
+
+static size_t tape_reals(const Cfg *c, int L) {
+    const size_t V = (size_t)L * c->T * (c->D + 1), A = (size_t)L * c->T * c->D * (c->D + 1) / 2;
+    return (size_t)L * (3 * c->d + 1 + PDIM(c) + c->T) + V * (1 + c->p + c->n * c->p + 1) + A * (1 + c->p);
+}
+
+static void tape_carve(const Cfg *c, int L, real *buf, int *ibuf, Tape *tp) {
+    const size_t V = (size_t)L * c->T * (c->D + 1), A = (size_t)L * c->T * c->D * (c->D + 1) / 2;
+    tp->xin = buf, buf += (size_t)L * c->d;
+    tp->u = buf, buf += (size_t)L * c->d;
+    tp->x = buf, buf += (size_t)L * c->d;
+    tp->rn = buf, buf += L;
+    tp->p = buf, buf += (size_t)L * PDIM(c);
+    tp->dt = buf, buf += (size_t)L * c->T;
+    tp->s = buf, buf += V;
+    tp->R = buf, buf += V * c->p;
+    tp->hprev = buf, buf += V * c->n * c->p;
+    tp->decay = buf, buf += V;
+    tp->as = buf, buf += A;
+    tp->aR = buf, buf += A * c->p;
+    tp->node = ibuf, ibuf += V;
+    tp->anode = ibuf;
+}
+
+// One layer forward over the sequence: x_res (L, d) in place (x_res += y). h: the node states (T * N, n * p), zeroed.
+typedef struct {
+    int Lmax;
+    real *tapes, *x, *h, *g, *xn, *dxn, *lg, *lam;
+    real *ds, *dR, *dp, *dx, *du, *gUr, *on, *Racc, *mx, *y;
+    int *itapes;
+    Tape *tp;
+} Work;
+
+static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int L, real *xres, real *h, Tape *tp, Work *w) {
+    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c);
+    const real *norm = P->norm + (size_t)l * d, *conv = P->conv + (size_t)l * K * d;
+    const real *w_in = Q->w_in + (size_t)l * T * N * d, *w_out = Q->w_out + (size_t)l * T * N * d;
+    const real *bias = P->bias + (size_t)l * T * N, *A_log = P->A_log + (size_t)l * T * N;
+    const real *proj = Q->proj + (size_t)l * Pd * d, *dt_bias = P->dt_bias + (size_t)l * T, *U = Q->U + (size_t)l * T * pv * d;
+    const int AL = D * (D + 1) / 2;
+    real *mx = w->mx, *y = w->y, *Racc = w->Racc;
+    for (int t = 0; t < L; t++) {
+        real *xt = tp->x + (size_t)t * d, *ut = tp->u + (size_t)t * d, *pt = tp->p + (size_t)t * Pd, *dtt = tp->dt + (size_t)t * T;
+        memcpy(tp->xin + (size_t)t * d, xres + (size_t)t * d, sizeof(real) * d);
+        rmsnorm_fwd(xres + (size_t)t * d, norm, ut, d, tp->rn + t);
+        for (int i = 0; i < d; i++) {
+            real a = 0;
+            for (int j = 0; j < K; j++)
+                if (t - j >= 0) a += conv[j * d + i] * tp->u[(size_t)(t - j) * d + i];
+            mx[i] = a;
+        }
+        quant8(mx, xt, d);
+        for (int r = 0; r < Pd; r++) pt[r] = dotr(proj + (size_t)r * d, xt, d);
+        const real *B = pt, *C = pt + n, *V = pt + 2 * n, *Z = pt + 2 * n + pv;
+        for (int tr = 0; tr < T; tr++) dtt[tr] = softplus(pt[2 * n + 2 * pv + tr] + dt_bias[tr]);
+        memset(y, 0, sizeof(real) * d);
+        for (int tr = 0; tr < T; tr++) {
+            const size_t vb = ((size_t)t * T + tr) * (D + 1);
+            memset(Racc, 0, sizeof(real) * pv);
+            int a = 0;
+            for (int k = 0; k <= D; k++) {  // the path: decay, read, branch, output, write
+                const size_t row = (size_t)tr * N + a, v = vb + k;
+                real *ha = h + row * n * pv, *R = tp->R + v * pv;
+                const real dec = exp(-exp(A_log[row]) * dtt[tr]);
+                memcpy(tp->hprev + v * n * pv, ha, sizeof(real) * n * pv);
+                for (int q = 0; q < pv; q++) R[q] = 0;
+                for (int j = 0; j < n; j++)
+                    for (int q = 0; q < pv; q++) {
+                        ha[j * pv + q] *= dec;
+                        R[q] += C[j] * ha[j * pv + q];
+                    }
+                real s = dotr(xt, w_in + row * d, d) + bias[row] + dotr(R, Z, pv);
+                const real gs = gelu(s);
+                for (int i = 0; i < d; i++) y[i] += gs * w_out[row * d + i];
+                for (int q = 0; q < pv; q++) Racc[q] += R[q];
+                for (int j = 0; j < n; j++)
+                    for (int q = 0; q < pv; q++) ha[j * pv + q] += dtt[tr] * B[j] * V[q];
+                tp->node[v] = (int)row, tp->s[v] = s, tp->decay[v] = dec;
+                a = 2 * a + 1 + (s > 0);
+            }
+            for (int q = 0; q < pv; q++)
+                for (int i = 0; i < d; i++) y[i] += Racc[q] * U[((size_t)tr * pv + q) * d + i];
+        }
+        // the other subtrees (read-only: their states as they stand at t, the token's own arrival decay)
+        for (int tr = 0; tr < T; tr++) {
+            const size_t vb = ((size_t)t * T + tr) * (D + 1), ab = ((size_t)t * T + tr) * AL;
+            int ai = 0;
+            for (int k = 0; k < D; k++) {
+                const int ak = tp->node[vb + k] - tr * N;
+                int cn = 2 * ak + 2 - (tp->s[vb + k] > 0);
+                for (int j = k + 1; j <= D; j++, ai++) {
+                    const size_t row = (size_t)tr * N + cn;
+                    const real dec = exp(-exp(A_log[row]) * dtt[tr]);
+                    real *R = tp->aR + (ab + ai) * pv;
+                    for (int q = 0; q < pv; q++) R[q] = 0;
+                    for (int jj = 0; jj < n; jj++)
+                        for (int q = 0; q < pv; q++) R[q] += C[jj] * dec * h[row * n * pv + jj * pv + q];
+                    const real s = dotr(xt, w_in + row * d, d) + bias[row] + dotr(R, Z, pv);
+                    tp->anode[ab + ai] = (int)row, tp->as[ab + ai] = s;
+                    cn = 2 * cn + 1 + (s > 0);
+                }
+            }
+        }
+        for (int i = 0; i < d; i++) xres[(size_t)t * d + i] += y[i];
+    }
+}
+
+// One layer backward: g (L, d) is dL/d(layer output) on entry and dL/d(layer input) on return; G accumulates.
+// lam: (T * N, n * p) adjoint states, zeroed. hit (T * N) node rows touched, set to 1.
+static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G, int l, int L, real *g, real *lam,
+                      unsigned char *hit, const Tape *tp, Work *w) {
+    const int d = c->d, T = c->T, D = c->D, n = c->n, pv = c->p, K = c->K, Pd = PDIM(c), N = NODES(c);
+    const int AL = D * (D + 1) / 2;
+    const real *norm = P->norm + (size_t)l * d, *conv = P->conv + (size_t)l * K * d;
+    const real *w_in = Q->w_in + (size_t)l * T * N * d, *w_out = Q->w_out + (size_t)l * T * N * d;
+    const real *A_log = P->A_log + (size_t)l * T * N;
+    const real *proj = Q->proj + (size_t)l * Pd * d, *dt_bias = P->dt_bias + (size_t)l * T, *U = Q->U + (size_t)l * T * pv * d;
+    real *gnorm = G->norm + (size_t)l * d, *gconv = G->conv + (size_t)l * K * d;
+    real *gw_in = G->w_in + (size_t)l * T * N * d, *gw_out = G->w_out + (size_t)l * T * N * d;
+    real *gbias = G->bias + (size_t)l * T * N, *gA = G->A_log + (size_t)l * T * N;
+    real *gproj = G->proj + (size_t)l * Pd * d, *gdtb = G->dt_bias + (size_t)l * T, *gU = G->U + (size_t)l * T * pv * d;
+    const size_t V = (size_t)L * T * (D + 1);
+    real *ds = w->ds, *dR = w->dR, *dp = w->dp, *dx = w->dx, *gUr = w->gUr, *on = w->on, *Racc = w->Racc;
+    memset(ds, 0, sizeof(real) * V), memset(dR, 0, sizeof(real) * V * pv);
+    memset(dp, 0, sizeof(real) * (size_t)L * Pd), memset(dx, 0, sizeof(real) * (size_t)L * d);
+    // A: per token, what the outputs need (no recurrence): node outputs, readout, branch gradient, s = s0 + <Z, R>
+    for (int t = 0; t < L; t++) {
+        const real *gy = g + (size_t)t * d, *xt = tp->x + (size_t)t * d, *pt = tp->p + (size_t)t * Pd;
+        const real *Z = pt + 2 * n + pv;
+        real *dZ = dp + (size_t)t * Pd + 2 * n + pv;
+        for (int tr = 0; tr < T; tr++) {
+            const size_t vb = ((size_t)t * T + tr) * (D + 1), ab = ((size_t)t * T + tr) * AL;
+            const real *Ut = U + (size_t)tr * pv * d;
+            memset(Racc, 0, sizeof(real) * pv);
+            for (int k = 0; k <= D; k++)
+                for (int q = 0; q < pv; q++) Racc[q] += tp->R[(vb + k) * pv + q];
+            for (int q = 0; q < pv; q++) {
+                gUr[q] = dotr(Ut + (size_t)q * d, gy, d);
+                for (int i = 0; i < d; i++) gU[((size_t)tr * pv + q) * d + i] += Racc[q] * gy[i];
+            }
+            for (int k = 0; k <= D; k++) {  // each path node's output, <g, out>, and its own gradients
+                const size_t v = vb + k, row = tp->node[v];
+                const real s = tp->s[v], go = dotr(gy, w_out + row * d, d);
+                on[k] = gelu(s) * go + dotr(gUr, tp->R + v * pv, pv);
+                for (int i = 0; i < d; i++) gw_out[row * d + i] += gelu(s) * gy[i];
+                ds[v] += dgelu(s) * go;
+                for (int q = 0; q < pv; q++) dR[v * pv + q] += gUr[q];
+                hit[row] = 1;
+            }
+            int ai = 0;
+            for (int k = 0; k < D; k++) {  // the branch: sign * (on - alt) * sigmoid'(s / temp) / temp
+                real onk = 0, alt = 0;
+                for (int j = k + 1; j <= D; j++) onk += on[j];
+                for (int j = k + 1; j <= D; j++, ai++) {
+                    const size_t a = ab + ai, row = tp->anode[a];
+                    alt += gelu(tp->as[a]) * dotr(gy, w_out + row * d, d) + dotr(gUr, tp->aR + a * pv, pv);
+                }
+                const real s = tp->s[vb + k], sg = sigm(fabs(s) / c->temp);
+                ds[vb + k] += (s > 0 ? 1 : -1) * (onk - alt) * sg * (1 - sg) / c->temp;
+            }
+            for (int k = 0; k <= D; k++) {  // s = <x, w_in> + bias + <Z, R>
+                const size_t v = vb + k, row = tp->node[v];
+                const real dsv = ds[v];
+                for (int q = 0; q < pv; q++) {
+                    dZ[q] += dsv * tp->R[v * pv + q];
+                    dR[v * pv + q] += dsv * Z[q];
+                }
+                for (int i = 0; i < d; i++) {
+                    gw_in[row * d + i] += dsv * xt[i];
+                    dx[(size_t)t * d + i] += dsv * w_in[row * d + i];
+                }
+                G->bias[(size_t)l * T * N + row] += dsv;
+            }
+        }
+    }
+    (void)gbias;
+    // B: the node states backward in time; per visit: h~ = decay h_prev, R = C^T h~, h = h~ + dt B V^T
+    for (int t = L - 1; t >= 0; t--) {
+        const real *pt = tp->p + (size_t)t * Pd, *B = pt, *C = pt + n, *Vv = pt + 2 * n;
+        real *dpt = dp + (size_t)t * Pd, *dB = dpt, *dC = dpt + n, *dV = dpt + 2 * n, *ddt = dpt + 2 * n + 2 * pv;
+        for (int tr = 0; tr < T; tr++) {
+            const real dtv = tp->dt[(size_t)t * T + tr];
+            for (int k = 0; k <= D; k++) {
+                const size_t v = ((size_t)t * T + tr) * (D + 1) + k, row = tp->node[v];
+                real *la = lam + row * n * pv;
+                const real *hp = tp->hprev + v * n * pv, dec = tp->decay[v], *dRv = dR + v * pv;
+                real ddec = 0;
+                for (int j = 0; j < n; j++)
+                    for (int q = 0; q < pv; q++) {
+                        const real lv = la[j * pv + q];
+                        dB[j] += dtv * lv * Vv[q];
+                        dV[q] += dtv * lv * B[j];
+                        ddt[tr] += lv * B[j] * Vv[q];
+                        dC[j] += dec * hp[j * pv + q] * dRv[q];
+                        const real dht = lv + C[j] * dRv[q];  // dL/dh~
+                        ddec += dht * hp[j * pv + q];
+                        la[j * pv + q] = dec * dht;  // dL/dh at the node's previous visit
+                    }
+                const real ea = exp(A_log[row]);
+                gA[row] += ddec * dec * -ea * dtv;
+                ddt[tr] += ddec * dec * -ea;
+            }
+        }
+    }
+    // C: the signals' projection and dt; then the 8-bit activations (straight-through), the conv and the norm
+    real *du = w->du;
+    memset(du, 0, sizeof(real) * (size_t)L * d);
+    for (int t = 0; t < L; t++) {
+        const real *pt = tp->p + (size_t)t * Pd, *xt = tp->x + (size_t)t * d;
+        real *dpt = dp + (size_t)t * Pd;
+        for (int tr = 0; tr < T; tr++) {  // dt = softplus(raw + dt_bias)
+            const real z = pt[2 * n + 2 * pv + tr] + dt_bias[tr];
+            const real dz = dpt[2 * n + 2 * pv + tr] * (z > 20 ? 1 : sigm(z));
+            dpt[2 * n + 2 * pv + tr] = dz;
+            gdtb[tr] += dz;
+        }
+        for (int r = 0; r < Pd; r++)
+            for (int i = 0; i < d; i++) {
+                gproj[(size_t)r * d + i] += dpt[r] * xt[i];
+                dx[(size_t)t * d + i] += dpt[r] * proj[(size_t)r * d + i];
+            }
+        for (int j = 0; j < K; j++)
+            if (t - j >= 0)
+                for (int i = 0; i < d; i++) {
+                    gconv[j * d + i] += dx[(size_t)t * d + i] * tp->u[(size_t)(t - j) * d + i];
+                    du[(size_t)(t - j) * d + i] += conv[j * d + i] * dx[(size_t)t * d + i];
+                }
+    }
+    for (int t = 0; t < L; t++) rmsnorm_bwd(tp->xin + (size_t)t * d, norm, tp->rn[t], du + (size_t)t * d, g + (size_t)t * d, gnorm, d);
+}
+
+// A workspace for sequences of up to Lmax tokens, allocated once and reused (fresh allocations of this size cost page
+// faults on every call).
+
+Work *tss_work_new(const Cfg *c, int Lmax) {
+    const int d = c->d, N = NODES(c), T = c->T, nl = c->n_layer;
+    const size_t tr = tape_reals(c, Lmax), ti = (size_t)Lmax * T * (c->D + 1 + c->D * (c->D + 1) / 2);
+    const size_t V = (size_t)Lmax * T * (c->D + 1), S = (size_t)T * N * c->n * c->p;
+    Work *w = calloc(1, sizeof(Work));
+    w->Lmax = Lmax;
+    w->tapes = calloc(tr * nl, sizeof(real));
+    w->itapes = calloc(ti * nl, sizeof(int));
+    w->tp = calloc(nl, sizeof(Tape));
+    w->x = calloc((size_t)Lmax * d, sizeof(real)), w->g = calloc((size_t)Lmax * d, sizeof(real));
+    w->h = calloc(S, sizeof(real)), w->lam = calloc(S, sizeof(real));
+    w->xn = calloc(d, sizeof(real)), w->dxn = calloc(d, sizeof(real)), w->lg = calloc(c->vocab, sizeof(real));
+    w->ds = calloc(V, sizeof(real)), w->dR = calloc(V * c->p, sizeof(real));
+    w->dp = calloc((size_t)Lmax * PDIM(c), sizeof(real));
+    w->dx = calloc((size_t)Lmax * d, sizeof(real)), w->du = calloc((size_t)Lmax * d, sizeof(real));
+    w->gUr = calloc(c->p, sizeof(real)), w->on = calloc(c->D + 1, sizeof(real)), w->Racc = calloc(c->p, sizeof(real));
+    w->mx = calloc(d, sizeof(real)), w->y = calloc(d, sizeof(real));
+    for (int l = 0; l < nl; l++) tape_carve(c, Lmax, w->tapes + tr * l, w->itapes + ti * l, w->tp + l);
+    return w;
+}
+
+void tss_work_free(Work *w) {
+    free(w->tapes), free(w->itapes), free(w->tp), free(w->x), free(w->g), free(w->h), free(w->lam), free(w->xn);
+    free(w->dxn), free(w->lg), free(w->ds), free(w->dR), free(w->dp), free(w->dx), free(w->du), free(w->gUr);
+    free(w->on), free(w->Racc), free(w->mx), free(w->y), free(w);
+}
+
+// One sequence: tokens (L), labels (L, -100 = unscored). Adds the sequence's summed cross-entropy gradients into G
+// (Params-shaped, zeroed by the caller) and its node-row hits into hit (n_layer * T * N bytes). Returns the summed loss;
+// *n_scored = the scored tokens. Q: the quantized weights (tss_quantize).
+real tss_train_seq(const Cfg *c, const Params *P, const Params *Q, Params *G, const int *tokens, const int *labels, int L,
+                   unsigned char *hit, int *n_scored, Work *w) {
+    const int d = c->d, N = NODES(c), T = c->T, nl = c->n_layer;
+    if (L > w->Lmax) return NAN;
+    Tape *tp = w->tp;  // carved for Lmax tokens: the strides are Lmax's, which L <= Lmax respects
+    real *x = w->x, *h = w->h;
+    for (int t = 0; t < L; t++) memcpy(x + (size_t)t * d, P->embed + (size_t)tokens[t] * d, sizeof(real) * d);
+    for (int l = 0; l < nl; l++) {
+        memset(h, 0, sizeof(real) * (size_t)T * N * c->n * c->p);
+        layer_fwd(c, P, Q, l, L, x, h, tp + l, w);
+    }
+    // the output layer (tied to the embedding), cross-entropy at the scored tokens
+    real loss = 0, *g = w->g, *xn = w->xn, *dxn = w->dxn, *lg = w->lg;
+    memset(g, 0, sizeof(real) * (size_t)L * d);
+    int ns = 0;
+    for (int t = 0; t < L; t++) {
+        if (labels[t] < 0) continue;
+        real r;
+        rmsnorm_fwd(x + (size_t)t * d, P->norm_f, xn, d, &r);
+        real m = -INFINITY, z = 0;
+        for (int v = 0; v < c->vocab; v++) lg[v] = dotr(P->embed + (size_t)v * d, xn, d), m = lg[v] > m ? lg[v] : m;
+        for (int v = 0; v < c->vocab; v++) z += exp(lg[v] - m);
+        loss += log(z) + m - lg[labels[t]];
+        ns++;
+        memset(dxn, 0, sizeof(real) * d);
+        for (int v = 0; v < c->vocab; v++) {
+            const real pr = exp(lg[v] - m) / z - (v == labels[t]);
+            for (int i = 0; i < d; i++) {
+                G->embed[(size_t)v * d + i] += pr * xn[i];
+                dxn[i] += pr * P->embed[(size_t)v * d + i];
+            }
+        }
+        rmsnorm_bwd(x + (size_t)t * d, P->norm_f, r, dxn, g + (size_t)t * d, G->norm_f, d);
+    }
+    real *lam = w->lam;
+    for (int l = nl - 1; l >= 0; l--) {
+        memset(lam, 0, sizeof(real) * (size_t)T * N * c->n * c->p);
+        layer_bwd(c, P, Q, G, l, L, g, lam, hit + (size_t)l * T * N, tp + l, w);
+    }
+    for (int t = 0; t < L; t++)  // the embedding's input side
+        for (int i = 0; i < d; i++) G->embed[(size_t)tokens[t] * d + i] += g[(size_t)t * d + i];
+    *n_scored = ns;
+    return loss;
+}
+
+// ----------------------------------------------------------------------------------------------- the training step
+// A batch of sequences across threads, each into its own gradient buffer (Gt[i], hits[i], ws[i]); the touched node rows
+// and the dense tensors summed into G; clipping by the global norm (over what was touched: the rest is zero); AdamW,
+// lazy on node rows (a row moves only in a step that touched it, as sparse embeddings do), dense elsewhere; the ternary
+// codes recomputed for the touched rows and the dense matrices. Returns the mean loss over the batch's scored tokens.
+
+typedef struct {
+    real lr, beta1, beta2, eps, weight_decay, clip;
+    long step;  // the step being taken, from 1
+} Hyper;
+
+#define N_FIELDS 11
+static void fields(const Params *p, real **f) {
+    f[0] = p->embed, f[1] = p->norm_f, f[2] = p->norm, f[3] = p->conv, f[4] = p->w_in, f[5] = p->bias;
+    f[6] = p->w_out, f[7] = p->A_log, f[8] = p->proj, f[9] = p->dt_bias, f[10] = p->U;
+}
+
+static void sizes(const Cfg *c, size_t *z) {
+    const size_t nl = c->n_layer, d = c->d, rows = nl * c->T * NODES(c);
+    z[0] = (size_t)c->vocab * d, z[1] = d, z[2] = nl * d, z[3] = nl * c->K * d, z[4] = rows * d, z[5] = rows;
+    z[6] = rows * d, z[7] = rows, z[8] = nl * PDIM(c) * d, z[9] = nl * c->T, z[10] = nl * c->T * c->p * d;
+}
+
+static int node_field(int f) { return f == 4 || f == 5 || f == 6 || f == 7; }
+
+static void adam(real *p, real *g, real *m, real *v, size_t n, const Hyper *h, real scale) {
+    const real b1 = h->beta1, b2 = h->beta2;
+    const real c1 = 1 - pow(b1, (real)h->step), c2 = 1 - pow(b2, (real)h->step);
+    for (size_t i = 0; i < n; i++) {
+        const real gi = g[i] * scale;
+        m[i] = b1 * m[i] + (1 - b1) * gi;
+        v[i] = b2 * v[i] + (1 - b2) * gi * gi;
+        p[i] -= h->lr * (h->weight_decay * p[i] + (m[i] / c1) / (sqrt(v[i] / c2) + h->eps));
+        g[i] = 0;
+    }
+}
+
+real tss_train_step(const Cfg *c, Params *P, Params *Q, Params *G, unsigned char *hit, Params *M, Params *Vm,
+                    Params *Gt, unsigned char *hits, Work **ws, int threads, const int *tokens, const int *labels, int B,
+                    int L, const Hyper *h) {
+    const size_t rows = (size_t)c->n_layer * c->T * NODES(c);
+    const int d = c->d;
+    real loss = 0;
+    int scored = 0;
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 1) reduction(+ : loss, scored)
+    for (int b = 0; b < B; b++) {
+#ifdef _OPENMP
+        const int th = omp_get_thread_num();
+#else
+        const int th = 0;
+#endif
+        int ns = 0;
+        loss += tss_train_seq(c, P, Q, Gt + th, tokens + (size_t)b * L, labels + (size_t)b * L, L, hits + rows * th, &ns, ws[th]);
+        scored += ns;
+    }
+    size_t z[N_FIELDS];
+    sizes(c, z);
+    real *gf[N_FIELDS], *pf[N_FIELDS], *mf[N_FIELDS], *vf[N_FIELDS];
+    fields(G, gf), fields(P, pf), fields(M, mf), fields(Vm, vf);
+    // sum the threads' buffers into G (touched rows only for the node tensors), zeroing them
+    memset(hit, 0, rows);
+    for (int th = 0; th < threads; th++)
+        for (size_t r = 0; r < rows; r++) hit[r] |= hits[rows * th + r];
+    for (int th = 0; th < threads; th++) {
+        real *tf[N_FIELDS];
+        fields(Gt + th, tf);
+        for (int f = 0; f < N_FIELDS; f++) {
+            if (node_field(f)) {
+                const size_t w = z[f] / rows;  // d for w_in / w_out, 1 for bias / A_log
+                for (size_t r = 0; r < rows; r++)
+                    if (hit[r])
+                        for (size_t i = 0; i < w; i++) gf[f][r * w + i] += tf[f][r * w + i], tf[f][r * w + i] = 0;
+            } else {
+                for (size_t i = 0; i < z[f]; i++) gf[f][i] += tf[f][i], tf[f][i] = 0;
+            }
+        }
+        memset(hits + rows * th, 0, rows);
+    }
+    // the mean over scored tokens, then the global norm's clip
+    const real inv = scored ? (real)1 / scored : 0;
+    real nrm = 0;
+    for (int f = 0; f < N_FIELDS; f++) {
+        if (node_field(f)) {
+            const size_t w = z[f] / rows;
+            for (size_t r = 0; r < rows; r++)
+                if (hit[r])
+                    for (size_t i = 0; i < w; i++) nrm += gf[f][r * w + i] * gf[f][r * w + i];
+        } else {
+            for (size_t i = 0; i < z[f]; i++) nrm += gf[f][i] * gf[f][i];
+        }
+    }
+    nrm = sqrt(nrm) * inv;
+    real scale = inv;
+    if (h->clip > 0 && nrm > h->clip) scale *= h->clip / (nrm + (real)1e-6);
+    for (int f = 0; f < N_FIELDS; f++) {
+        if (node_field(f)) {
+            const size_t w = z[f] / rows;
+            for (size_t r = 0; r < rows; r++)
+                if (hit[r]) adam(pf[f] + r * w, gf[f] + r * w, mf[f] + r * w, vf[f] + r * w, w, h, scale);
+        } else {
+            adam(pf[f], gf[f], mf[f], vf[f], z[f], h, scale);
+        }
+    }
+    // the codes: the touched node rows, the dense matrices
+    for (size_t r = 0; r < rows; r++)
+        if (hit[r]) {
+            tss_ternary(P->w_in + r * d, Q->w_in + r * d, 1, d, c->group);
+            tss_ternary(P->w_out + r * d, Q->w_out + r * d, 1, d, c->group);
+        }
+    tss_ternary(P->proj, Q->proj, (long)c->n_layer * PDIM(c), d, c->group);
+    tss_ternary(P->U, Q->U, (long)c->n_layer * c->T * c->p, d, c->group);
+    return scored ? loss / scored : 0;
+}
+"""
+
+
+def _c_tensors(model):
+    """The parameters in the C trainer's layout: name -> tensors, layer after layer."""
+    L = model.layers
+    return {"embed": [model.embed.weight], "norm_f": [model.norm_f.weight], "norm": [n.weight for n in model.norms],
+            "conv": [l.conv for l in L], "w_in": [l.w_in for l in L], "bias": [l.bias for l in L], "w_out": [l.w_out for l in L],
+            "A_log": [l.A_log for l in L], "proj": [l.proj.weight for l in L], "dt_bias": [l.dt_bias for l in L], "U": [l.U for l in L]}
+
+
+class CTrainer:
+    """The sparse C training step (C_TRAIN_SOURCE) on a model's own parameters: the model's tensors become views of
+    the C arrays, so the PyTorch model evaluates whatever the trainer has trained, with nothing copied. Readout per tree,
+    memory, ternary weights and 8-bit activations (the defaults). double=True builds in float64 (selftest --c)."""
+
+    NAMES = ["embed", "norm_f", "norm", "conv", "w_in", "bias", "w_out", "A_log", "proj", "dt_bias", "U"]
+
+    def __init__(self, model, threads=1, Lmax=4096, lr=3e-3, weight_decay=0.01, clip=1.0, double=False):
+        import ctypes
+
+        import numpy as np
+
+        c = model.cfg
+        assert c.readout == "tree" and c.memory and c.ternary and c.act_bits == 8, "the C trainer: readout tree, ternary, 8-bit"
+        self.np, self.ct = np, ctypes
+        flags = ("-DREAL=double",) if double else ()
+        lib = self.lib = ctypes.CDLL(build_c(C_TRAIN_SOURCE, "train", flags))
+        R = ctypes.c_double if double else ctypes.c_float
+        self.dtype = np.float64 if double else np.float32
+        PR = self.PR = ctypes.POINTER(R)
+
+        class Cfg(ctypes.Structure):
+            _fields_ = [(k, ctypes.c_int) for k in ("vocab", "d", "n_layer", "T", "D", "n", "p", "K", "group")] + [("temp", R)]
+
+        class Params(ctypes.Structure):
+            _fields_ = [(k, PR) for k in self.NAMES]
+
+        class Hyper(ctypes.Structure):
+            _fields_ = [(k, R) for k in ("lr", "beta1", "beta2", "eps", "weight_decay", "clip")] + [("step", ctypes.c_long)]
+
+        PP, P8, PI = ctypes.POINTER(Params), ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_int)
+        lib.tss_work_new.restype = ctypes.c_void_p
+        lib.tss_work_new.argtypes = [ctypes.POINTER(Cfg), ctypes.c_int]
+        lib.tss_quantize.argtypes = [ctypes.POINTER(Cfg), PP, PP]
+        lib.tss_train_seq.restype = R
+        lib.tss_train_seq.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, PI, PI, ctypes.c_int, P8, PI, ctypes.c_void_p]
+        lib.tss_train_step.restype = R
+        lib.tss_train_step.argtypes = [ctypes.POINTER(Cfg), PP, PP, PP, P8, PP, PP, PP, P8, ctypes.POINTER(ctypes.c_void_p),
+                                       ctypes.c_int, PI, PI, ctypes.c_int, ctypes.c_int, ctypes.POINTER(Hyper)]
+        self.cfg = Cfg(c.vocab_size, c.d_model, c.n_layer, c.trees, c.depth, c.state, c.value, c.d_conv,
+                       group_size(c.d_model, c.ternary_group), c.temp)
+        tensors = _c_tensors(model)
+        self.arrays = {k: np.ascontiguousarray(torch.cat([t.detach().flatten() for t in v]).numpy().astype(self.dtype))
+                       for k, v in tensors.items()}
+        zeros = lambda: {k: np.zeros_like(v) for k, v in self.arrays.items()}  # noqa: E731
+        mk = lambda d: Params(*[d[k].ctypes.data_as(PR) for k in self.NAMES])  # noqa: E731
+        self.grads, self.q, self.m, self.v = zeros(), zeros(), zeros(), zeros()
+        self.P, self.G, self.Q, self.M, self.V = mk(self.arrays), mk(self.grads), mk(self.q), mk(self.m), mk(self.v)
+        lib.tss_quantize(ctypes.byref(self.cfg), ctypes.byref(self.P), ctypes.byref(self.Q))
+        rows = c.n_layer * c.trees * (2 ** (c.depth + 1) - 1)
+        self.hit = np.zeros(rows, dtype=np.uint8)
+        self.threads = threads
+        self.gt = [zeros() for _ in range(threads)]
+        self.Gt = (Params * threads)(*[mk(g) for g in self.gt])
+        self.hits = np.zeros(threads * rows, dtype=np.uint8)
+        self.ws = (ctypes.c_void_p * threads)(*[lib.tss_work_new(ctypes.byref(self.cfg), Lmax) for _ in range(threads)])
+        self.hp = Hyper(lr, 0.9, 0.98, 1e-8, weight_decay, clip, 0)
+        for k, ts in tensors.items():  # the model's parameters become views of the C arrays
+            off = 0
+            for t in ts:
+                t.data = torch.from_numpy(self.arrays[k][off : off + t.numel()]).view(t.shape)
+                off += t.numel()
+
+    def _ptr(self, a, kind):
+        return a.ctypes.data_as(self.ct.POINTER(kind))
+
+    def grad(self, tokens, labels):
+        """One sequence's summed loss; its gradients added into self.grads (the C layout, not the model's .grad)."""
+        tok = self.np.ascontiguousarray(tokens, dtype=self.np.int32)
+        lab = self.np.ascontiguousarray(labels, dtype=self.np.int32)
+        ns = self.ct.c_int()
+        return self.lib.tss_train_seq(self.ct.byref(self.cfg), self.ct.byref(self.P), self.ct.byref(self.Q), self.ct.byref(self.G),
+                                      self._ptr(tok, self.ct.c_int), self._ptr(lab, self.ct.c_int), len(tok),
+                                      self._ptr(self.hit, self.ct.c_uint8), self.ct.byref(ns), self.ws[0])
+
+    def step(self, tokens, labels, lr):
+        """One AdamW step on a batch, tokens and labels (B, L); returns the mean loss over the scored tokens."""
+        B, L = tokens.shape
+        tok = self.np.ascontiguousarray(tokens, dtype=self.np.int32)
+        lab = self.np.ascontiguousarray(labels, dtype=self.np.int32)
+        self.hp.lr, self.hp.step = lr, self.hp.step + 1
+        b = self.ct.byref
+        return self.lib.tss_train_step(b(self.cfg), b(self.P), b(self.Q), b(self.G), self._ptr(self.hit, self.ct.c_uint8),
+                                       b(self.M), b(self.V), self.Gt, self._ptr(self.hits, self.ct.c_uint8), self.ws, self.threads,
+                                       self._ptr(tok, self.ct.c_int), self._ptr(lab, self.ct.c_int), B, L, b(self.hp))
+
+
+def selftest_c():
+    """The C training step against autograd, in float64: the loss and every parameter's gradient."""
+    import numpy as np
+
+    torch.manual_seed(0)
+    cfg = Config(vocab_size=50, d_model=32, n_layer=2, trees=3, depth=3, state=4, value=6, ternary_group=16)
+    model = TSS(cfg).double()
+    for layer in model.layers:
+        layer.w_in.data *= 4
+    ids = torch.randint(0, 50, (2, 20))
+    labels = ids.clone()
+    labels[:, :5] = -100
+    loss = F.cross_entropy(model(ids).flatten(0, 1), labels.flatten(), reduction="sum")
+    loss.backward()
+    want = {k: torch.cat([t.grad.flatten() for t in ts]).numpy() for k, ts in _c_tensors(model).items()}
+    tr = CTrainer(model, Lmax=64, double=True)
+    closs = sum(tr.grad(ids[b].numpy(), labels[b].numpy()) for b in range(2))
+    assert abs(closs - loss.item()) < 1e-9 * abs(loss.item()), f"C loss {closs} != {loss.item()}"
+    worst = max((np.abs(want[k] - tr.grads[k]).max() / (np.abs(want[k]).max() + 1e-30), k) for k in want)
+    print(f"C training step vs autograd, float64: loss equal, worst gradient {worst[0]:.1e} ({worst[1]})")
+    assert worst[0] < 1e-12, "the C training step's gradients disagree with autograd"
+    print("selftest --c passed")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     st = sub.add_parser("selftest")
     st.add_argument("--kernels", action="store_true", help="the Triton kernels against the PyTorch paths")
+    st.add_argument("--c", action="store_true", help="the sparse C training step against autograd (float64)")
     m = sub.add_parser("mqar")
     m.add_argument("--no-memory", dest="memory", action="store_false")
     m.add_argument("--kv", type=int, default=8)
@@ -1686,6 +2368,7 @@ def main():
     m.add_argument("--value", type=int, default=16)
     m.add_argument("--readout", default="tree", choices=["level", "tree", "layer"])
     m.add_argument("--float", dest="quant", action="store_false", help="float weights and activations (the ablation)")
+    m.add_argument("--engine", default="torch", choices=["torch", "c"], help="c: the sparse C training step (CPU)")
     m.add_argument("--steps", type=int, default=2000)
     m.add_argument("--batch", type=int, default=64)
     m.add_argument("--lr", type=float, default=3e-3)
@@ -1703,7 +2386,8 @@ def main():
     bn.add_argument("--readout", default="tree", choices=["level", "tree", "layer"])
     bn.add_argument("--tokens", type=int, default=20000)
     a = p.parse_args()
-    {"selftest": lambda a: selftest_kernels() if a.kernels else selftest(), "mqar": mqar, "bench": bench}[a.cmd](a)
+    {"selftest": lambda a: selftest_kernels() if a.kernels else selftest_c() if a.c else selftest(), "mqar": mqar,
+     "bench": bench}[a.cmd](a)
 
 
 if __name__ == "__main__":
