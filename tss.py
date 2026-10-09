@@ -32,8 +32,14 @@ Two forms of one function:
   work per tree, branches and gathers.
 * ``forward``: the training form. Levels run in turn and each level is parallel over time: routing at level k
   depends only on what was written to level-k nodes, i.e. on decisions at levels < k, so there is no circularity.
-  Within a level, the read is a masked, decayed sum over earlier tokens at the same node (quadratic in length here);
-  the branch gradient's other side reads the same way at the nodes a token did not visit.
+  Within a level the tokens are sorted by node, so that each node's visitors are contiguous and in time order, and
+  the whole level is one segmented linear scan (``segscan``: Mamba-2's chunked scan, the segments' resets as masks),
+  linear in length; the branch gradient's other side enters the same scan as read-only entries (no write, no decay
+  passed on). This is the shape a GPU wants: after the sort, the threads of a chunk work on one node's tokens, one
+  weight row and one decay rate (no divergence), over contiguous memory (coalesced); a level is a sort, gathers and
+  batched small matrix products, as a mixture-of-experts dispatch. Training cost per token is flat in length
+  (2 layers, d 64, 4 trees of depth 5, 4 CPU threads: ~240 us/token from 64 to 4,096 tokens, against a quadratic
+  form's 1.5 s a step at 1,024).
 ``selftest`` checks, in float64, that the training form equals the recurrence (routes included) and that its
 gradients equal those of ``reference``, the path-weight definition over every node.
 
@@ -177,66 +183,79 @@ class TreeSSM(nn.Module):
         return B, C, V, Z, F.softplus(dt + self.dt_bias)
 
     def forward(self, u):
-        """The training form, u: (b, l, d). Levels in turn, each parallel over time. Going backward each branch learns
-        from GTS's straight-through gradient: sign * (on - alt) * sigmoid'(s / temp) / temp, where on is what the
-        subtree the token took output below the branch and alt what the other subtree would have, following the
-        token's own decisions and reading the states it would have found there (``reference`` is the definition)."""
+        """The training form, u: (b, l, d). Levels in turn; within a level, every node's state over time is one
+        segmented scan (``segscan``) over the level's tokens sorted by node: linear in length. Going backward each
+        branch learns from GTS's straight-through gradient: sign * (on - alt) * sigmoid'(s / temp) / temp, where on is
+        what the subtree the token took output below the branch and alt what the other subtree would have, following
+        the token's own decisions and reading the states it would have found there (``reference`` is the definition).
+        Those reads are the same scan's read-only entries."""
         cfg = self.cfg
         b, L, _ = u.shape
         T, D = cfg.trees, cfg.depth
         x = self.mix(u)
         w_in, w_out, proj, U = self.weights()
         tree = torch.arange(T, device=u.device)
-        mem = None
         if cfg.memory:
             B, C, V, Z, dt = self.signals(x, proj)
-            strict = torch.ones(L, L, dtype=torch.bool, device=u.device).tril(-1)[None, :, :, None]  # s < t
-            mem = (torch.einsum("btn,bsn->bts", C, B), V, Z, dt, strict)
 
-        def visit(node, k, visitors=None):
-            """Each token at node (b, l, trees) of level k: its activation s and its node output (b, l, trees, d).
-            visitors: (nodes, inclusive clocks) of the tokens that did visit level k, if not these."""
+        def reads(node, queries=()):
+            """What each token at node (b, l, trees) of a level reads there (its visitors before it, then its own
+            write), and for each node tensor in queries, what that token would read there (no write)."""
+            if not cfg.memory:
+                return None, [None] * len(queries)
+            M, n_nodes = b * L * T, self.w_in.shape[1]
+            bi = torch.arange(b, device=u.device).view(b, 1, 1).expand(b, L, T).reshape(-1)
+            li = torch.arange(L, device=u.device).view(1, L, 1).expand(b, L, T).reshape(-1)
+            ti = tree.view(1, 1, T).expand(b, L, T).reshape(-1)
+            nodes = torch.cat([node.reshape(-1)] + [q.reshape(-1) for q in queries])
+            k = len(queries) + 1
+            bi, li, ti = bi.repeat(k), li.repeat(k), ti.repeat(k)
+            member = torch.arange(k * M, device=u.device) < M
+            seg = (bi * T + ti) * n_nodes + nodes  # a segment: one node of one tree of one sequence
+            order = torch.argsort(seg * L + li)  # contiguous segments, in time within each
+            dt_e = dt[bi, li, ti]
+            log_decay = -torch.exp(self.A_log[ti, nodes]) * dt_e
+            zero = torch.zeros((), dtype=dt.dtype, device=u.device)
+            a_e = torch.where(member, log_decay, zero)  # a query decays nothing that comes after it
+            X_e = torch.where(member[:, None], dt_e[:, None] * V[bi, li], zero)
+            Y = segscan(C[bi, li][order], B[bi, li][order], X_e[order], a_e[order], seg[order])
+            Y = torch.zeros_like(Y).index_copy(0, order, Y)
+            Y = torch.where(member[:, None], Y, Y * torch.exp(log_decay)[:, None])  # a query's own arrival decay
+            R = Y[:M].view(b, L, T, -1)
+            return R, [Y[M * (i + 1) : M * (i + 2)].view(b, L, T, -1) for i in range(len(queries))]
+
+        def visit(node, k, R):
+            """Each token at node (b, l, trees) of level k, having read R there: its activation s and output."""
             s = torch.einsum("bld,bltd->blt", x, w_in[tree, node]) + self.bias[tree, node]
-            out = F.gelu(s)[..., None] * w_out[tree, node]
-            clock = None
-            if mem is not None:
-                CB, V, Z, dt, strict = mem
-                vnode, vclock = visitors if visitors else (node, None)
-                same = (node[:, :, None, :] == vnode[:, None, :, :]) & strict  # (b, t, s, trees): s was there before t
-                clock = torch.einsum("btsh,bsh->bth", same.to(dt.dtype), dt) + dt  # dt summed over arrivals there, t's own included
-                vclock = clock if vclock is None else vclock
-                gap = (clock[:, :, None] - vclock[:, None, :]) * torch.exp(self.A_log[tree, node])[:, :, None]
-                M = torch.exp(-gap.masked_fill(~same, torch.inf)) * dt[:, None] * CB[..., None]
-                R = torch.einsum("btsh,bsp->bthp", M, V)  # what each token reads there, (b, l, trees, value)
-                s = s + (R * Z[:, :, None]).sum(-1)
-                out = F.gelu(s)[..., None] * w_out[tree, node] + torch.einsum("blhp,hpd->blhd", R, self.U_at(U, k))
-            return s, out, clock
+            if R is None:
+                return s, F.gelu(s)[..., None] * w_out[tree, node]
+            s = s + (R * Z[:, :, None]).sum(-1)
+            return s, F.gelu(s)[..., None] * w_out[tree, node] + torch.einsum("blhp,hpd->blhd", R, self.U_at(U, k))
 
         node = torch.zeros(b, L, T, dtype=torch.long, device=u.device)
-        path = []  # per level: node, s, output, inclusive clock
+        path = []  # per level: node, s, output
         for k in range(D + 1):
-            s, out, clock = visit(node, k)
-            path.append((node, s, out, clock))
+            s, out = visit(node, k, reads(node)[0])
+            path.append((node, s, out))
             node = 2 * node + 1 + (s > 0).long()
-        y = sum(out for _, _, out, _ in path).sum(2)
+        y = sum(out for _, _, out in path).sum(2)
         if not torch.is_grad_enabled() or D == 0:
             return y
         with torch.no_grad():  # the branch gradient's two sides: on (taken, below the branch) and alt (the other child down)
-            outs = torch.stack([out for _, _, out, _ in path])
-            on = outs.flip(0).cumsum(0).flip(0)  # on[k] = sum of levels >= k
-            diff = []
-            for k in range(D):
-                a, s_k = path[k][0], path[k][1]
-                alt_node, alt = 2 * a + 2 - (s_k > 0).long(), 0  # the other child
-                for j in range(k + 1, D + 1):
-                    s_alt, out_alt, _ = visit(alt_node, j, (path[j][0], path[j][3]))
-                    alt = alt + out_alt
-                    alt_node = 2 * alt_node + 1 + (s_alt > 0).long()
-                diff.append(on[k + 1] - alt)
+            on = torch.stack([out for _, _, out in path]).flip(0).cumsum(0).flip(0)  # on[k] = sum of levels >= k
+            chains = []  # per branch level k: the other subtree's node on the current level, and its output so far
+            for j in range(1, D + 1):
+                a, s_prev = path[j - 1][0], path[j - 1][1]
+                chains.append([2 * a + 2 - (s_prev > 0).long(), 0])  # the other child of level j - 1's branch
+                _, alt_reads = reads(path[j][0], [c[0] for c in chains])  # the level's visitors, the chains as queries
+                for c, R in zip(chains, alt_reads):
+                    s_alt, out_alt = visit(c[0], j, R)
+                    c[1] = c[1] + out_alt
+                    c[0] = 2 * c[0] + 1 + (s_alt > 0).long()
         for k in range(D):
             s_k = path[k][1]
             g = torch.sigmoid(torch.where(s_k > 0, s_k, -s_k) / cfg.temp)
-            y = y + torch.einsum("blt,bltd->bld", g - g.detach(), diff[k])  # zero going forward
+            y = y + torch.einsum("blt,bltd->bld", g - g.detach(), on[k + 1] - chains[k][1])  # zero going forward
         return y
 
     def reference(self, u):
@@ -314,6 +333,47 @@ class TreeSSM(nn.Module):
         return y
 
 
+def segscan(C, B, X, a, seg, chunk=64):
+    """Y_i = sum over j < i with seg_j = seg_i of exp(a_{j+1} + ... + a_i) <C_i, B_j> X_j, over one stream sorted so
+    that each segment is contiguous: C, B (M, state); X (M, value); a (M,) log-decays <= 0; seg (M,) ids. Linear in M:
+    chunks of ``chunk`` entries, each read within its chunk as a masked quadratic form plus the state carried in from
+    the chunks before (Mamba-2's chunked scan, with the segments' resets as masks rather than as log-decays of -inf,
+    which would cost float32 its precision). On a GPU each chunk is one program: the same node's tokens in a row
+    (one weight row, one decay rate, no divergence) and contiguous loads."""
+    M, Q = X.shape[0], chunk
+    pad = -M % Q
+    if pad:
+        z = lambda t: torch.cat([t, t.new_zeros((pad,) + t.shape[1:])])  # noqa: E731
+        C, B, X, a = z(C), z(B), z(X), z(a)
+        seg = torch.cat([seg, -1 - torch.arange(pad, device=seg.device)])  # padding: segments of its own
+    nc = (M + pad) // Q
+    C, B, X, a, seg = C.view(nc, Q, -1), B.view(nc, Q, -1), X.view(nc, Q, -1), a.view(nc, Q), seg.view(nc, Q)
+    cs = a.cumsum(1)  # inclusive, within the chunk
+    strict = torch.ones(Q, Q, dtype=torch.bool, device=a.device).tril(-1)
+    same = (seg[:, :, None] == seg[:, None, :]) & strict
+    W = torch.exp((cs[:, :, None] - cs[:, None, :]).masked_fill(~same, -torch.inf)) * (C @ B.transpose(1, 2))
+    Y = W @ X
+    # the state each chunk hands on: that of the segment open at its end
+    last = seg[:, -1]
+    S = torch.einsum("cj,cjn,cjp->cnp", torch.exp(cs[:, -1:] - cs) * (seg == last[:, None]), B, X)
+    # H[c] = sum over c' < c with last[c'] = last[c - 1] of exp(the decays of chunks c' + 1 .. c - 1) S[c']: the state
+    # entering chunk c. Segment ids ascend along the stream, so this is the same scan one level up, over the chunks
+    # (C = B = 1, the states as values): G[c] = scan + S[c] inclusive, H[c] = G[c - 1]. Few chunks: one masked matrix.
+    A = cs[:, -1]
+    if nc > Q:
+        Sf = S.reshape(nc, -1)
+        one = Sf.new_ones(nc, 1)
+        G = segscan(one, one, Sf, A, last, chunk) + Sf
+    else:
+        same_c = (last[:, None] == last[None, :]) & torch.ones(nc, nc, dtype=torch.bool, device=a.device).tril()
+        Gc = A.cumsum(0)
+        G = (torch.exp((Gc[:, None] - Gc[None, :]).masked_fill(~same_c, -torch.inf)) @ S.reshape(nc, -1))
+    H = torch.cat([G.new_zeros(1, G.shape[1]), G[:-1]]).view_as(S)
+    reader = seg == torch.cat([last.new_full((1,), -2), last[:-1]])[:, None]  # in the segment that was carried in
+    Y = Y + (reader * torch.exp(cs))[..., None] * (C @ H)
+    return Y.reshape(nc * Q, -1)[:M]
+
+
 class TSS(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -371,8 +431,26 @@ def selftest():
         assert not bad, f"{cfg}: gradients != definition: {bad}"
         missing = [n for n, a in zip(names, g1) if not a.abs().sum() > 0]
         assert not missing, f"{cfg}: no gradient: {missing}"
+    # the segmented scan against a loop, chunks small enough that segments span several, gradients included
+    torch.manual_seed(1)
+    M, n, p = 57, 3, 4
+    C, B, X = (torch.randn(M, k, dtype=torch.float64, requires_grad=True) for k in (n, n, p))
+    a = (-torch.rand(M, dtype=torch.float64)).requires_grad_()
+    seg = torch.repeat_interleave(torch.arange(9), torch.tensor([1, 13, 2, 9, 1, 1, 17, 6, 7]))
+    want, h = [], None
+    for i in range(M):
+        h = torch.zeros(n, p, dtype=torch.float64) if i == 0 or seg[i] != seg[i - 1] else h * torch.exp(a[i])
+        want.append(C[i] @ h)  # read the state the earlier entries left, decayed by this entry's arrival
+        h = h + B[i][:, None] * X[i][None, :]
+    want = torch.stack(want)
+    for q in (4, 5, 64):
+        got = segscan(C, B, X, a, seg, chunk=q)
+        g = torch.randn_like(got)
+        assert torch.allclose(got, want, atol=1e-12), f"segscan, chunk {q}: values"
+        gw, gg = torch.autograd.grad(want, (C, B, X, a), g, retain_graph=True), torch.autograd.grad(got, (C, B, X, a), g)
+        assert all(torch.allclose(x, y, atol=1e-10) for x, y in zip(gw, gg)), f"segscan, chunk {q}: gradients"
     print("selftest passed: training form == recurrence (routes included) and its gradients == the path-weight definition "
-          "(ternary and float; stateful and stateless; every readout)")
+          "(ternary and float; stateful and stateless; every readout); the segmented scan == its loop")
 
 
 # -------------------------------------------------------------------------------------------------------------- mqar
