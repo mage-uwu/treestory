@@ -2035,6 +2035,7 @@ typedef struct {
     Tape *tp;
     const Codes *k;  // the row codes (the fast path), or NULL
     uint64_t rng;    // the walks' sampler (cfg walks > 0)
+    int no_alt;      // forward only (evaluation): skip the branch gradient's walks
 } Work;
 
 static inline real urand(uint64_t *s) {  // xorshift64*, uniform in [0, 1)
@@ -2136,7 +2137,7 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
         // trees' are independent, so they advance level by level together and their fetches overlap. Each chain's
         // nodes are stored at base(kk) + (level - kk - 1), base(kk) = sum over m < kk of (D - m).
         int *cn = w->walk;
-        for (int tr = 0; tr < T; tr++) {
+        for (int tr = 0; tr < T && !w->no_alt; tr++) {
             const size_t vb = ((size_t)t * T + tr) * (D + 1);
             real tot = 0;
             for (int kk = 0; kk < D; kk++) {
@@ -2156,7 +2157,7 @@ static void layer_fwd(const Cfg *c, const Params *P, const Params *Q, int l, int
                 tp->bw[v] = urand(&w->rng) < q ? 1 / q : 0;
             }
         }
-        for (int j = 1; j <= D; j++)
+        for (int j = 1; j <= D && !w->no_alt; j++)
             for (int tr = 0; tr < T; tr++) {
                 const size_t ab = ((size_t)t * T + tr) * AL;
                 for (int kk = 0, base = 0; kk < j; base += D - kk, kk++) {
@@ -2219,7 +2220,7 @@ static void layer_bwd(const Cfg *c, const Params *P, const Params *Q, Params *G,
     memset(dp, 0, sizeof(real) * (size_t)L * Pd), memset(dx, 0, sizeof(real) * (size_t)L * d);
     // A: per token, what the outputs need (no recurrence): node outputs, readout, branch gradient, s = s0 + <Z, R>
     for (int t = 0; t < L; t++) {
-        const real *gy = g + (size_t)t * d, *xt = tp->x + (size_t)t * d, *pt = tp->p + (size_t)t * Pd;
+        const real *gy = g + (size_t)t * d, *pt = tp->p + (size_t)t * Pd;
         const real *Z = pt + 2 * n + pv;
         real *dZ = dp + (size_t)t * Pd + 2 * n + pv, *dxt = dx + (size_t)t * d;
         for (int tr = 0; tr < T; tr++) {
